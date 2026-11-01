@@ -38,12 +38,12 @@ use chrono::{DateTime, Local, NaiveDateTime};
 /// - By hostname: for forward DNS resolution
 /// - By IP: for direct reverse DNS lookup
 /// - By MAC: for IPv6 reverse lookup via neighbor cache
+#[derive(Default)]
 struct LeaseData {
-    /// Index by hostname
     name_to_client: DomainMap<Arc<ClientInfo>>,
-    /// Index by IP address (for direct reverse lookup)
+    ipv4_name_to_client: DomainMap<Arc<ClientInfo>>,
+    ipv6_name_to_client: DomainMap<Arc<ClientInfo>>,
     ip_to_client: HashMap<IpAddr, Arc<ClientInfo>>,
-    /// Index by MAC address (for IPv6 reverse lookup via neighbor cache)
     mac_to_client: HashMap<String, Arc<ClientInfo>>,
 }
 
@@ -71,15 +71,11 @@ impl LeaseData {
 /// The cache is protected by `RwLock` and accessed via `Arc` for
 /// efficient read-heavy operations (DNS lookups).
 struct LeaseCache {
-    /// Clients indexed by hostname
-    clients: Arc<DomainMap<Arc<ClientInfo>>>,
-    /// Clients indexed by IP address
+    ipv4_clients: Arc<DomainMap<Arc<ClientInfo>>>,
+    ipv6_clients: Arc<DomainMap<Arc<ClientInfo>>>,
     ip_clients: Arc<HashMap<IpAddr, Arc<ClientInfo>>>,
-    /// Clients indexed by MAC address
     mac_clients: Arc<HashMap<String, Arc<ClientInfo>>>,
-    /// Last modification time of the lease file
-    modified_at: Option<SystemTime>,
-    /// Last time this cache was checked for updates
+    modified_at: Vec<Option<SystemTime>>,
     checked_at: Instant,
 }
 
@@ -95,13 +91,10 @@ const IPV6_NEIGHBOR_CACHE_REFRESH: Duration = Duration::from_secs(2);
 /// The neighbor cache is automatically refreshed by running `ip -6 neigh` command
 /// every 2 seconds, keeping the cache up to date with network changes.
 pub struct LanClientStore {
-    /// DNS zone for name resolution
     zone: Option<Name>,
-    /// Path to the dnsmasq lease file
-    lease_file: PathBuf,
-    /// Cached lease data with update metadata
+    lease_file: Option<PathBuf>,
+    odhcpd_files: Vec<PathBuf>,
     cache: RwLock<Option<LeaseCache>>,
-    /// IPv6 neighbor cache (enabled automatically when lease file is configured)
     neighbor_cache: Option<Arc<NeighborStore>>,
 }
 
@@ -121,10 +114,26 @@ impl LanClientStore {
     pub fn new<P: AsRef<Path>>(file: P, zone: Option<Name>) -> Self {
         Self {
             zone,
-            lease_file: file.as_ref().to_owned(),
+            lease_file: Some(file.as_ref().to_owned()),
+            odhcpd_files: Vec::new(),
             cache: Default::default(),
             neighbor_cache: Some(Arc::new(NeighborStore::new())),
         }
+    }
+
+    pub fn from_odhcpd<P: AsRef<Path>>(file: P, zone: Option<Name>) -> Self {
+        Self {
+            zone,
+            lease_file: None,
+            odhcpd_files: vec![file.as_ref().to_owned()],
+            cache: Default::default(),
+            neighbor_cache: None,
+        }
+    }
+
+    pub fn with_odhcpd_file<P: AsRef<Path>>(mut self, file: P) -> Self {
+        self.odhcpd_files.push(file.as_ref().to_owned());
+        self
     }
 
     /// Refresh the IPv6 neighbor cache by running `ip -6 neigh` command.
@@ -141,54 +150,90 @@ impl LanClientStore {
     ///
     /// Returns `None` if the lease file cannot be read and no cache exists.
     /// Automatically refreshes the neighbor cache after reading lease data.
-    fn get_cached_clients(&self) -> Option<Arc<DomainMap<Arc<ClientInfo>>>> {
+    fn get_cached_clients(
+        &self,
+    ) -> Option<(
+        Arc<DomainMap<Arc<ClientInfo>>>,
+        Arc<DomainMap<Arc<ClientInfo>>>,
+    )> {
         let now = Instant::now();
 
         {
             let cache = self.cache.read().unwrap_or_else(|err| err.into_inner());
+
             if let Some(cache) = cache.as_ref()
                 && now.duration_since(cache.checked_at) < LEASE_FILE_STAT_INTERVAL
             {
-                return Some(cache.clients.clone());
+                return Some((cache.ipv4_clients.clone(), cache.ipv6_clients.clone()));
             }
         }
 
-        let modified_at = std::fs::metadata(self.lease_file.as_path())
-            .ok()
-            .and_then(|meta| meta.modified().ok());
+        let modified_at = self
+            .lease_file
+            .iter()
+            .chain(self.odhcpd_files.iter())
+            .map(|path| {
+                std::fs::metadata(path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+            })
+            .collect::<Vec<_>>();
 
         {
             let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+
             if let Some(cache) = cache.as_mut() {
                 if now.duration_since(cache.checked_at) < LEASE_FILE_STAT_INTERVAL {
-                    return Some(cache.clients.clone());
+                    return Some((cache.ipv4_clients.clone(), cache.ipv6_clients.clone()));
                 }
 
                 if cache.modified_at == modified_at {
                     cache.checked_at = now;
-                    return Some(cache.clients.clone());
+
+                    return Some((cache.ipv4_clients.clone(), cache.ipv6_clients.clone()));
                 }
             }
         }
 
-        let refreshed = read_lease_file(self.lease_file.as_path(), self.zone.as_ref()).ok();
+        let mut lease_mappings = LeaseData::default();
+        let mut loaded = false;
+
+        if let Some(path) = self.lease_file.as_ref()
+            && let Ok(mappings) = read_lease_file(path, self.zone.as_ref())
+        {
+            lease_mappings = mappings;
+            loaded = true;
+        }
+
+        for path in &self.odhcpd_files {
+            if read_odhcpd_lease_file(path, self.zone.as_ref(), &mut lease_mappings).is_ok() {
+                loaded = true;
+            }
+        }
+
+        let refreshed = loaded.then_some(lease_mappings);
 
         let mut cache = self.cache.write().unwrap_or_else(|err| err.into_inner());
+
         if let Some(lease_mappings) = refreshed {
             *cache = Some(LeaseCache {
-                clients: Arc::new(lease_mappings.name_to_client),
+                ipv4_clients: Arc::new(lease_mappings.ipv4_name_to_client),
+                ipv6_clients: Arc::new(lease_mappings.ipv6_name_to_client),
                 ip_clients: Arc::new(lease_mappings.ip_to_client),
                 mac_clients: Arc::new(lease_mappings.mac_to_client),
                 modified_at,
                 checked_at: now,
             });
-            // Refresh neighbor cache for IPv6 reverse lookup
+
             let _ = self.refresh_neighbor_cache();
-            Some(cache.as_ref().unwrap().clients.clone())
+
+            let cache = cache.as_ref().unwrap();
+
+            Some((cache.ipv4_clients.clone(), cache.ipv6_clients.clone()))
         } else if let Some(cache) = cache.as_mut() {
-            // read failed, keep existing cache and avoid hot-loop retries.
             cache.checked_at = now;
-            Some(cache.clients.clone())
+
+            Some((cache.ipv4_clients.clone(), cache.ipv6_clients.clone()))
         } else {
             None
         }
@@ -199,7 +244,13 @@ impl LanClientStore {
     /// Supports A (IPv4) and AAAA (IPv6) record types.
     /// Handles zone suffix appending if configured.
     pub fn lookup(&self, name: &Name, record_type: RecordType) -> Option<RData> {
-        let store = self.get_cached_clients()?;
+        let (ipv4_store, ipv6_store) = self.get_cached_clients()?;
+
+        let store = match record_type {
+            RecordType::A => ipv4_store,
+            RecordType::AAAA => ipv6_store,
+            _ => return None,
+        };
 
         let mut name = name.clone();
 
@@ -376,6 +427,8 @@ fn read_lease_file<P: AsRef<Path>>(path: P, zone: Option<&Name>) -> std::io::Res
     let reader = BufReader::new(file);
 
     let mut name_map = HashMap::new();
+    let mut ipv4_name_map = HashMap::new();
+    let mut ipv6_name_map = HashMap::new();
     let mut ip_map = HashMap::new();
     let mut mac_map = HashMap::new();
 
@@ -400,18 +453,124 @@ fn read_lease_file<P: AsRef<Path>>(path: P, zone: Option<&Name>) -> std::io::Res
             }
             client_info.host.set_fqdn(true);
             let client_info = Arc::new(client_info);
+
             name_map.insert(client_info.host.clone().into(), client_info.clone());
+
+            match client_info.ip {
+                IpAddr::V4(_) => {
+                    ipv4_name_map.insert(client_info.host.clone().into(), client_info.clone());
+                }
+                IpAddr::V6(_) => {
+                    ipv6_name_map.insert(client_info.host.clone().into(), client_info.clone());
+                }
+            }
+
             ip_map.insert(client_info.ip, client_info.clone());
-            // Also index by MAC address (normalize to lowercase)
             mac_map.insert(client_info.mac.to_lowercase(), client_info);
         }
     }
 
     Ok(LeaseData {
         name_to_client: name_map.into(),
+        ipv4_name_to_client: ipv4_name_map.into(),
+        ipv6_name_to_client: ipv6_name_map.into(),
         ip_to_client: ip_map,
         mac_to_client: mac_map,
     })
+}
+
+fn read_odhcpd_lease_file<P: AsRef<Path>>(
+    path: P,
+    zone: Option<&Name>,
+    lease_data: &mut LeaseData,
+) -> std::io::Result<()> {
+    let file = File::open(path.as_ref())?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+
+        // odhcpd DHCPv6 lease format:
+        // # interface DUID IAID hostname valid_until assigned_id prefix_len address/prefix
+        if parts.len() < 9 || parts[0] != "#" {
+            continue;
+        }
+
+        let hostname = parts[4];
+
+        // Skip missing and escaped invalid hostnames.
+        if hostname == "-" || hostname.contains('\\') {
+            continue;
+        }
+
+        let mut host = match Name::from_str(hostname) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(z) = zone
+            && let Ok(name) = host.clone().append_name(z)
+        {
+            host = name;
+        }
+
+        host.set_fqdn(true);
+
+        let valid_until = match parts[5].parse::<i64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let expires_at = if valid_until == -1 {
+            NaiveDateTime::MAX
+        } else {
+            DateTime::from_timestamp(valid_until, 0)
+                .map(|v| v.naive_utc())
+                .unwrap_or_else(|| Local::now().naive_local())
+        };
+
+        let id = format!("{}:{}", parts[2], parts[3]);
+
+        for address in parts.iter().skip(8) {
+            let Some((address, prefix_len)) = address.rsplit_once('/') else {
+                continue;
+            };
+
+            // Only host addresses, not delegated prefixes.
+            if prefix_len.parse::<u8>().ok() != Some(128) {
+                continue;
+            }
+
+            let Ok(IpAddr::V6(ip)) = IpAddr::from_str(address) else {
+                continue;
+            };
+
+            let client_info = Arc::new(ClientInfo {
+                id: id.clone(),
+                ip: IpAddr::V6(ip),
+                host: host.clone(),
+                mac: String::new(),
+                expires_at,
+            });
+
+            lease_data
+                .name_to_client
+                .insert(client_info.host.clone(), client_info.clone());
+
+            lease_data
+                .ipv6_name_to_client
+                .insert(client_info.host.clone(), client_info.clone());
+
+            lease_data.ip_to_client.insert(client_info.ip, client_info);
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert a PTR query name to an IP address.
