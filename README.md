@@ -1,32 +1,79 @@
 # SmartDNS-rs
-
-![Test](https://github.com/mokeyish/smartdns-rs/actions/workflows/test.yml/badge.svg?branch=main)
-[![Crates.io Version](https://img.shields.io/crates/v/smartdns.svg)](https://crates.io/crates/smartdns)
-[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/mokeyish/smartdns-rs?display_name=tag&include_prereleases)](https://github.com/mokeyish/smartdns-rs/releases)
-[![homebrew version](https://img.shields.io/homebrew/v/smartdns)](https://formulae.brew.sh/formula/smartdns)
+Fork of fork: https://github.com/schalkiii/smartdns-rs
+![Test](https://github.com/schalkiii/smartdns-rs/actions/workflows/test.yml/badge.svg?branch=main)
+[![GitHub release (latest by date including pre-releases)](https://img.shields.io/github/v/release/schalkiii/smartdns-rs?display_name=tag&include_prereleases)](https://github.com/schalkiii/smartdns-rs/releases)
 ![OS](https://img.shields.io/badge/os-Windows%20%7C%20MacOS%20%7C%20Linux-blue)
 
 [Docs](https://pymumu.github.io/smartdns/en/) •
 
-English | [中文](https://github.com/mokeyish/smartdns-rs/blob/main/README_zh-CN.md)
+English | [中文](https://github.com/schalkiii/smartdns-rs/blob/main/README_zh-CN.md)
 
 SmartDNS-rs 🐋 is a local DNS server imspired by [C SmartDNS](https://github.com/pymumu/smartdns) to accepts DNS query requests from local clients, obtains DNS query results from multiple upstream DNS servers, and returns the fastest access results to clients. Avoiding DNS pollution and improving network access speed, supports high-performance ad filtering.
 
+---
 
+## Why SmartDNS-rs?
+
+This project is a **Rust reimplementation** of [SmartDNS](https://github.com/pymumu/smartdns) with several architectural and performance improvements:
+
+| Feature               | SmartDNS (C)                            | SmartDNS-rs (Rust)                       |
+| --------------------- | --------------------------------------- | ---------------------------------------- |
+| **Platform Support**  | Linux only (with Docker/WSL for others) | Native Windows, macOS, Linux, Android    |
+| **HTTP Service**      | Separate process required               | Built-in async HTTP server               |
+| **Concurrency Model** | Thread-based                            | Tokio async runtime                      |
+| **Memory Safety**     | Manual memory management                | Compile-time safety guarantees           |
+| **Configuration**     | File-based only                         | File + REST API hot-reload               |
+| **Web UI**            | Not included                            | Built-in dashboard                       |
+| **Background Tasks**  | Basic                                   | Queue-based with rate limiting           |
+| **Cache Prefetch**    | Fixed interval                          | Configurable batch + exponential backoff |
+| **Statistics**        | Limited                                 | Separate foreground/background metrics   |
+
+## Enhancements over the upstream project
+
+This repository is a production-hardened fork of [mokeyish/smartdns-rs](https://github.com/mokeyish/smartdns-rs). Beyond the upstream codebase it adds a fully featured Web UI, a series of performance optimizations and robustness fixes — most of them driven by **real long-running deployment issues** (weeks of continuous operation in a home LAN with mixed UDP/DoT/DoH upstreams). Highlights:
+
+### Web UI (major expansion)
+
+- **Query Log page** (new): the most recent 1000 queries from an in-memory ring buffer, with domain / client / record-type filters, auto-refresh toggle and manual refresh — backed by the new `/api/query-log` endpoint.
+- **Upstream server statistics** (new): per-server IP, port, protocol (UDP/TCP/DoT/DoH/DoQ/DoH3), security (encrypted/plaintext), runtime status (healthy/error), query/success/failure totals, average response time and success rate, plus aggregate totals — via `/api/nameservers` and `/api/stats/top-domains|clients|query-types`.
+- **Overview page** (new): top domains & active clients ranking.
+- **Accurate cache hit rate**: replaced the ambiguous "sum of per-entry hit counts" (which required cloning the entire cache on every `/stats` poll) with an O(1) per-query hit counter.
+- The `web-ui` feature is **enabled by default** — every build ships with the dashboard.
+
+### Performance
+
+- **Busy fast-fail**: upstream `Busy` errors are no longer retried (which occupied semaphore slots and triggered forced reconnections), cutting the "busy → reconnect → slower → busier" death spiral that used to push p95 upstream latency to ~440ms after weeks of uptime.
+- **Zombie request elimination**: `NameServerGroup` uses detached tasks instead of `FuturesUnordered` with early cancel, so race-losing queries finish naturally and release their `DnsMultiplexer` slots instead of accumulating as "zombies" that exhaust the 32-slot buffer.
+- **Per-NameServer concurrency limiting**: a dedicated semaphore per upstream server, plus an application-level deadline/timeout wrapper covering the whole upstream lookup (including TCP/TLS/QUIC handshake).
+- **Prefetch pipeline fixes**: heap-based ready queue (no full scans), prefetch timer leak fix that degraded long-running performance, cache-shard locking, and negative caching (NXDOMAIN/NODATA, including dual-stack AAAA misses) restored — measurably improving cache hit rate in home networks.
+- **Middleware hot path**: reduced redundant allocations in the DNS middleware chain.
+
+### Robustness
+
+- **Circuit breaker per upstream**: consecutive-failure tracking with cooldown skipping; `SERVFAIL`/`REFUSED` responses now also trip the breaker.
+- **Panic elimination sweep**: ~20 `panic!`/`todo!()`/`expect()` hot paths hardened — empty upstream groups, UDP upstreams misconfigured with an HTTP proxy, partial listener bind failures, poisoned mutexes, non-UTF-8 CLI args, unknown config directives, audit write-thread failures, prefetch `clear()` missing the ready heap, and more.
+- **No blocking on the response path**: audit writes go through a bounded channel and never block DNS responses; DoT handshakes are time-bounded (slowloris protection); background (prefetch) queries are no longer silently dropped, fixing `active_queries` counter leaks.
+
+### Operations & CI
+
+- Docker images published to `ghcr.io` on every release; reproducible release pipeline (`workflow_dispatch` → GitHub Release with per-platform assets + sha256sums, 13 targets).
+- Long-running operational tuning captured in the docs: recommended config for `speed-check-mode none`, cache sizing, and upstream health triage (see Troubleshooting below).
+
+---
 
 ## Features
 
 - **Multiple upstream DNS servers**
 
-  Supports configuring multiple upstream DNS servers and query at the same  time.the query will not be affected, Even if there is a DNS server  exception.
+  Supports configuring multiple upstream DNS servers and query at the same time.the query will not be affected, Even if there is a DNS server exception.
 
 - **Return the fastest IP address**
 
-  Supports finding the fastest access IP address from the IP address list  of the domain name and returning it to the client to avoid DNS pollution and improve network access speed.
+  Supports finding the fastest access IP address from the IP address list of the domain name and returning it to the client to avoid DNS pollution and improve network access speed.
 
 - **Support for multiple query protocols**
 
-  Supports UDP, TCP, DoT, DoQ, DoH, DoH3 queries and  service, and non-53 port queries, effectively avoiding DNS pollution and protect privacy, and support query DNS over socks5, http proxy.
+  Supports UDP, TCP, DoT, DoQ, DoH, DoH3 queries and service, and non-53 port queries, effectively avoiding DNS pollution and protect privacy, and support query DNS over socks5, http proxy.
 
 - **Domain IP address specification**
 
@@ -50,7 +97,27 @@ SmartDNS-rs 🐋 is a local DNS server imspired by [C SmartDNS](https://github.c
 
 - **High performance, low resource consumption**
 
-  Tokio-based multi-threaded asynchronous I/O model; caches query  results; supports most-used domain name expired prefetching, query **'0'**  milliseconds, without eliminating the impact of DoH and DoT encryption.
+  Tokio-based multi-threaded asynchronous I/O model; caches query results; supports most-used domain name expired prefetching, query **'0'** milliseconds, without eliminating the impact of DoH and DoT encryption.
+
+- **Advanced Statistics & Monitoring**
+
+  Separately tracks foreground and background query metrics including query counts and average response times. The Web UI displays four real-time metrics — overall average query time, cache-hit query time, upstream query time, and background prefetch time — making it easy to pinpoint performance bottlenecks.
+
+- **Cache Prefetch Optimization**
+
+  Intelligent cache prefetching with exponential backoff for failed requests to prevent resource exhaustion. The batch limit (`PREFETCH_MAX_BATCH`, default 5 domains) and the minimum interval (`PREFETCH_MIN_INTERVAL`, default 500 ms) are **environment variables**, not config-file options — the scanner also caps each pass at 16 candidates.
+
+- **Background Task Queue**
+
+  Bounded channel-based rate limiting for background tasks ensures smooth traffic control and prevents worker thread saturation.
+
+- **Web UI Dashboard**
+
+  Built-in web dashboard with a single-page tabbed interface for real-time monitoring and management. Supports system overview (with top domains/clients ranking), upstream server inspection (per-server IP/port/protocol/security/status/query counts/success rate/average time), query log browsing with filters, cache management with search/flush, and rule management with address/forward CRUD.
+
+- **Configuration parity with the C version**
+
+  Every C SmartDNS directive that maps onto this architecture is implemented and tested (audited in v0.13.5): `txt-record`, multi-value `srv-record`, `cache-mem-size`, `max-query-limit`, `socket-buff-size`, `force-no-CNAME`, `local-domain`, `local-ptr-enable`, `odhcpd-lease-file`, `data-dir`, `log-color`, `log-syslog`, `audit-SOA` / `audit-console` / `audit-syslog`, `ipset*`, `nftset-*`, `ip-rules`, `acl-enable`, `group-match`, `server-http3`, the `bind-cert-*` self-signed family, and `debug-save-fail-packet*`. The full audit, per-batch notes and recommended values live in [docs/port-gap-analysis.md](docs/port-gap-analysis.md).
 
 Note: The C version of smartdns is very functional, but because it only supports **Linux**, while **MacOS and Windows** can only be supported through Docker or WSL. Therefore, I want to develop a rust version of SmartDNS that supports compiling to Windows, MacOS, Linux and Android Termux environment to run, and is compatible with its configuration.
 
@@ -58,13 +125,32 @@ Note: The C version of smartdns is very functional, but because it only supports
 
 **It is still under development, please do not use it in production environment, welcome to try and provide feedback.**
 
-Please refer to [TODO](https://github.com/mokeyish/smartdns-rs/blob/main/TODO.md) for the function coverage
-
-
+Please refer to [TODO](https://github.com/schalkiii/smartdns-rs/blob/main/TODO.md) for the function coverage
 
 ## Installing
 
-*Nightly builds can be found [here](https://github.com/mokeyish/smartdns-rs/actions/workflows/nightly.yml).*
+_Nightly builds can be found [here](https://github.com/schalkiii/smartdns-rs/actions/workflows/nightly.yml)._
+
+Release assets cover the targets below. Every package is published together with its own
+`<file>-sha256sum.txt`, and each release also carries an aggregate `SHA256SUMS-<version>.txt`:
+
+```shell
+sha256sum -c SHA256SUMS-<version>.txt
+```
+
+Every package also contains a ready-to-use `smartdns.conf` plus `example.conf`, the fully
+commented reference for all options.
+
+| Platform | Target triple | Packages |
+| :--- | :--- | :--- |
+| Windows x64 | `x86_64-pc-windows-msvc` | `.msi`, `.zip` |
+| Windows x86 (32-bit) | `i686-pc-windows-msvc` | `.msi`, `.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `.msi`, `.zip` |
+| macOS Intel | `x86_64-apple-darwin` | `.zip` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | `.zip` |
+| Linux (glibc) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `.tar.gz` |
+| Linux (musl, static — OpenWrt/routers) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `i686-unknown-linux-musl`, `arm-unknown-linux-musleabi`, `arm-unknown-linux-musleabihf`, `armv7-unknown-linux-musleabihf` | `.tar.gz` |
+| Android | `aarch64-linux-android`, `armv7-linux-androideabi` | `.tar.gz` |
 
 - MacOS
 
@@ -83,7 +169,8 @@ Please refer to [TODO](https://github.com/mokeyish/smartdns-rs/blob/main/TODO.md
 
 - Windows / Linux
 
-  Go to [here](https://github.com/mokeyish/smartdns-rs/releases) to download the package and decompress it.
+  Go to [here](https://github.com/schalkiii/smartdns-rs/releases) to download the package and decompress it.
+  The package ships a ready-to-use `smartdns.conf` — common upstream servers are already configured, so it works without editing — together with `example.conf`, the fully commented reference for every option.
 
   1. Get help
 
@@ -107,9 +194,9 @@ Please refer to [TODO](https://github.com/mokeyish/smartdns-rs/blob/main/TODO.md
      ./smartdns service --help
      ```
 
-     *Note: Installed as a system service, administrator / root permissions are required.*
+     _Note: Installed as a system service, administrator / root permissions are required._
 
-     *Service management is compatible with all systems, call [sc](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc754599(v=ws.11)) on Windows; call `launchctl` or `brew` on MacOS; call `Systemd` or `OpenRc` on Linux.*
+     _Service management is compatible with all systems, call [sc](<https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-r2-and-2012/cc754599(v=ws.11)>) on Windows; call `launchctl` or `brew` on MacOS; call `Systemd` or `OpenRc` on Linux._
 
 ## Configuration
 
@@ -117,9 +204,9 @@ The following is the simplest example configuration
 
 ```conf
 # Listen on local port 53
-bind 127.0.0.1:53  
+bind 127.0.0.1:53
 
-# Configure bootstrap-dns, if not configured, call the system_conf, 
+# Configure bootstrap-dns, if not configured, call the system_conf,
 # it is recommended to configure, so that it will be encrypted.
 server https://1.1.1.1/dns-query  -bootstrap-dns -exclude-default-group
 server https://8.8.8.8/dns-query  -bootstrap-dns -exclude-default-group
@@ -149,7 +236,7 @@ server-h3 1.1.1.1
 server-quic unfiltered.adguard-dns.com
 ```
 
-For more advanced configurations, please refer to [here](https://github.com/pymumu/smartdns/blob/doc/en/docs/configuration.md) , and refer to [TODO](https://github.com/mokeyish/smartdns-rs/blob/main/TODO.md) for the function coverage.
+For more advanced configurations, please refer to [here](https://github.com/pymumu/smartdns/blob/doc/en/docs/configuration.md) , and refer to [TODO](https://github.com/schalkiii/smartdns-rs/blob/main/TODO.md) for the function coverage.
 
 ## Built-in diagnostics via `dig`
 
@@ -186,19 +273,82 @@ dig @127.0.0.1 CH TXT version.bind +short
 dig @127.0.0.1 CH TXT id.server +short
 ```
 
+## Web UI Dashboard
+
+SmartDNS-rs includes an embedded web dashboard accessible over HTTP. It provides real-time monitoring of DNS query statistics, cache inspection, upstream server status, and rule management — all in a single-page tabbed interface.
+
+### Screenshots
+
+System overview — uptime, cache hit rate, and the four timing metrics (combined, cache hit, upstream, background prefetch):
+
+![System overview](docs/images/webui-overview.png)
+
+Upstream servers — protocol, status, query counts, success rate and average latency per server:
+
+![Upstream servers](docs/images/webui-upstreams.png)
+
+Cache management — cache capacity, entry search and flush:
+
+![Cache management](docs/images/webui-cache.png)
+
+### Enabling the Dashboard
+
+1. **Enable the `web-ui` feature at build time** (already enabled by default):
+
+   ```shell
+   cargo build --release --features web-ui
+   ```
+
+   Pre-built releases and default builds include this feature.
+
+2. **Configure the HTTP listener** in your `smartdns.conf`:
+
+   The shipped default already enables it on loopback only (`bind-http 127.0.0.1:8080`).
+   Use the form below to listen on every interface — the dashboard has no authentication, so
+   only do this on a network you control.
+
+   The same listener also exposes mutating endpoints: `POST /api/caches/flush`,
+   `POST /api/config/reload`, and `POST`/`PUT`/`DELETE /api/addresses`. If you need it beyond
+   loopback, put it behind a reverse proxy that adds authentication.
+
+   ```conf
+   bind-http :8080
+   ```
+
+3. **Start SmartDNS-rs** and open `http://localhost:8080/dashboard` in your browser.
+
+### Dashboard Sections
+
+| Tab                       | Description                                                                                                                            |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| **系统概览 (Overview)**   | Uptime, cache hit rate, average query time, total/active queries, cache entry count, query trend area chart, top cache entries, top domains & active clients ranking.        |
+| **上游服务器 (Upstream)** | Configured upstream DNS servers with IP, port, protocol (UDP/TCP/DoT/DoH/DoQ/DoH3), security (encrypted/plaintext), runtime status, query/success/failure counts, average response time and success rate, plus aggregate totals. Listener port configuration. |
+| **缓存管理 (Cache)**      | Cache size limit, current entry count, searchable cache entry table with hit counts and last access timestamps, one-click cache flush. |
+| **规则管理 (Rules)**      | Address rules (domain → IP mapping) and forward rules management. Supports creating new rules via dialog and deleting existing ones.   |
+| **查询日志 (Query Log)**  | Most recent 1000 queries (in-memory ring buffer, cleared on restart) with domain/client/record-type filters, auto-refresh toggle and manual refresh. |
+
+### Key Metrics
+
+- **Cache hit rate**: calculated as `query_hits / total_queries` using a per-query counter in the DNS middleware, providing accurate real-time hit rate tracking.
+- **Query trend**: area chart showing total queries vs cache hits over time (up to 120 snapshots).
+- **Query statistics**: total queries, active queries, average query time, and cache entry count.
+
 ## Building
 
 Assuming you have installed [Rust](https://www.rust-lang.org/learn/get-started), then you can open the terminal and execute these commands:
 
 ```shell
-git clone https://github.com/mokeyish/smartdns-rs.git
+git clone https://github.com/schalkiii/smartdns-rs.git
 cd smartdns-rs
 
 # install https://github.com/casey/just
 cargo install just
 
-# build
+# build (web-ui dashboard included by default)
 just build --release
+
+# build (without web-ui, minimal binary)
+just build --release --no-default-features
 
 # print help
 ./target/release/smartdns --help
@@ -208,6 +358,42 @@ sudo ./target/release/smartdns run -c ./etc/smartdns/smartdns.conf
 ```
 
 For cross-compilation, it is recommended to use [cross](https://github.com/cross-rs/cross) (requires Docker).
+
+## Troubleshooting
+
+### Long-running network anomalies (resource too busy)
+
+**Symptom**: After running for a long time, DNS queries become slow or fail, and logs show frequent `resource too busy` errors.
+
+**Root cause**: When `NameServerGroup` queries multiple upstream servers in parallel, the first successful response cancels the remaining queries. These cancelled queries leave "zombie" request entries in the `DnsMultiplexer` until the upstream server responds or times out. Slow upstream servers (5s timeout) allow zombies to accumulate and exhaust the 32-slot buffer, causing new queries to fail with `Busy` errors.
+
+**Fix (already applied)**: NameServerGroup now uses detached tasks instead of `FuturesUnordered` with early return. Queries that lose the race complete naturally in the background, releasing their slots without creating zombies.
+
+**Recommended config tuning**:
+- Remove unreliable upstream servers (expired certs, frequent timeouts) from your config — they are the primary source of both zombie accumulation and real query failures.
+- Use `speed-check-mode none` if you don't need ping-based IP selection, to reduce per-query overhead.
+- Keep `cache-size` large (e.g., 65536) to maximize cache hit rate and reduce upstream load.
+
+### Upstream DNS server health
+
+If you see `Failed to connect to any nameserver` errors in logs, check the health of your configured upstream servers:
+- **Certificate expired**: Remove or update the server URL.
+- **TLS handshake timeout**: The server may be unreachable or overloaded. Consider removing it.
+- **Request timeout**: Network path issues. Try a different server or protocol (e.g., switch from DoH to plain UDP).
+
+Use `log-level debug` to see detailed retry and error information.
+
+### Instant SERVFAIL with `no connections available`
+
+**Symptom**: some uncached names fail after tens of microseconds (e.g. `elapsed: 79.8µs`) with `proto error: no connections available`, so the client gets SERVFAIL while other names resolve normally. The window right after a restart is worse because the cache is cold.
+
+**What it is not**: it is not an empty server group — that path logs `no available nameserver found for <name>` at ERROR level, which is absent when this happens. It is also not a version regression: the same random name failed with `rcode=2` on both v0.13.2 and v0.13.5 running side by side on this machine, and over 16 uncached real domains v0.13.5 resolved 13 while v0.13.2 resolved 10.
+
+**Root cause — fixed in v0.13.8**: the upstream circuit breaker was counting *legitimate negative answers* as failures. hickory returns NXDOMAIN and NODATA as `ProtoErrorKind::NoRecordsFound`, which is a typed `Err`, so every "this name does not exist" answer incremented the failure streak. Three in a row put a perfectly healthy server into a 30-second cooldown. Because `response-mode fastest-response` fans the same name out to every server in the group, one burst of non-existent names (AAAA queries for IPv4-only hosts, dead tracker domains) parks all of them at once, and the whole chain then fails in microseconds instead of resolving.
+
+**The fix**: `dns_client::is_negative_answer` treats `NoRecordsFound` carrying `NXDomain` or `NoError` as a normal answer — it clears the streak and counts as a success, while `ServFail`, `Refused` and timeouts still trip the breaker. Additionally, if every server in a group is cooling down, the group now clears the counters and lets one real probe through (half-open), so a network that has already recovered is not locked out for the rest of the cooldown window.
+
+**Measured**: on a debug instance with three upstreams, a run of 24 unique non-existent names reached an upstream only 6 times before the fix, all 6 were recorded as failures, 42 lookups were skipped as `in cooldown, skipping`, and the second batch of 12 failed instantly with SERVFAIL. The same load after the fix issued 72 upstream queries with 0 failures and 0 cooldown skips.
 
 ## Acknowledgments !!!
 

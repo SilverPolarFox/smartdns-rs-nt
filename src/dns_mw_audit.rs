@@ -1,10 +1,13 @@
+use std::collections::VecDeque;
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
 use chrono::prelude::*;
+use serde::Serialize;
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, Sender};
 
@@ -14,8 +17,50 @@ use crate::libdns::proto::op::Query;
 use crate::log::warn;
 use crate::middleware::*;
 
+/// 内存中保留的最近查询日志条数（用于 WebUI 查询日志页面展示）。
+pub const QUERY_LOG_MAX: usize = 1000;
+
+/// WebUI 查询日志条目（内存环形缓冲，非持久化）。
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryLogEntry {
+    pub time: DateTime<Local>,
+    pub client: String,
+    pub domain: String,
+    pub query_type: String,
+    pub elapsed_ms: f64,
+    pub result: String,
+    pub speed_ms: Option<f64>,
+    pub source: String,
+}
+
+impl From<&DnsAuditRecord> for QueryLogEntry {
+    fn from(a: &DnsAuditRecord) -> Self {
+        QueryLogEntry {
+            time: a.date,
+            client: a.client.clone(),
+            domain: a.query.name().to_utf8(),
+            query_type: a.query.query_type().to_string(),
+            elapsed_ms: a.elapsed.as_secs_f64() * 1000.0,
+            result: if a.result.is_ok() {
+                "success".to_string()
+            } else {
+                "failed".to_string()
+            },
+            speed_ms: if a.speed.is_zero() {
+                None
+            } else {
+                Some(a.speed.as_secs_f64() * 1000.0)
+            },
+            source: format!("{:?}", a.lookup_source),
+        }
+    }
+}
+
 pub struct DnsAuditMiddleware {
     audit_sender: Sender<DnsAuditRecord>,
+    query_log: Arc<Mutex<VecDeque<QueryLogEntry>>>,
+    audit_soa: bool,
+    audit_console: bool,
 }
 
 #[async_trait::async_trait]
@@ -32,6 +77,11 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsAuditMiddl
 
         let res = next.run(ctx, req).await;
 
+        // 对应 C 版 audit.c:127：SOA-only 应答默认不写审计，audit-SOA yes 时才记录
+        if !self.audit_soa && is_soa_only(&res) {
+            return res;
+        }
+
         let duration = start.elapsed();
 
         let audit = DnsAuditRecord {
@@ -45,47 +95,112 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsAuditMiddl
             lookup_source: ctx.source.clone(),
         };
 
+        // 写入 WebUI 查询日志环形缓冲（内存，非持久化）。
+        {
+            let mut q = self.query_log.lock().unwrap();
+            q.push_back(QueryLogEntry::from(&audit));
+            if q.len() > QUERY_LOG_MAX {
+                q.pop_front();
+            }
+        }
+
         // debug!("{}", audit.to_string_without_date());
 
-        self.audit_sender
-            .send(audit)
-            .await
-            .unwrap_or_else(|err| warn!("send audit failed,{}", err));
+        // 审计发送不得阻塞请求返回路径：有界通道(容量100)满时直接丢弃（审计允许丢失），
+        // 否则磁盘 IO 缓慢时所有 DNS 响应延迟都会被审计写盘速度拖住。
+        if self.audit_sender.try_send(audit).is_err() {
+            warn!("audit queue full, dropping audit record");
+        }
 
         res
     }
 }
 
+/// 审计输出配置。
+#[derive(Debug, Clone, Default)]
+pub struct AuditOptions {
+    pub file: Option<PathBuf>,
+    pub size: u64,
+    pub num: usize,
+    pub mode: Option<u32>,
+    pub soa: bool,
+    pub console: bool,
+    pub syslog: bool,
+}
+
 impl DnsAuditMiddleware {
-    pub fn new<P: AsRef<Path>>(
-        path: P,
-        audit_size: u64,
-        audit_num: usize,
-        mode: Option<u32>,
-    ) -> Self {
-        let audit_file = path.as_ref().to_owned();
+    /// 构建审计中间件。
+    ///
+    /// `query_log` 为 WebUI 查询日志环形缓冲（始终写入，无论是否启用磁盘审计）；
+    /// `audit_file` 为可选的磁盘审计文件路径，仅在启用审计文件时传入，否则仅写入内存查询日志。
+    pub fn new(query_log: Arc<Mutex<VecDeque<QueryLogEntry>>>, options: AuditOptions) -> Self {
+        let AuditOptions {
+            file: audit_file,
+            size: audit_size,
+            num: audit_num,
+            mode,
+            soa: audit_soa,
+            console: audit_console,
+            syslog: audit_syslog,
+        } = options;
 
         let (audit_tx, mut audit_rx) = mpsc::channel::<DnsAuditRecord>(100);
 
-        tokio::spawn(async move {
-            let mut audit_file = MappedFile::open(audit_file, audit_size, Some(audit_num), mode);
+        if let Some(audit_file) = audit_file {
+            tokio::spawn(async move {
+                let mut audit_file =
+                    MappedFile::open(audit_file, audit_size, Some(audit_num), mode);
 
-            const BUF_SIZE: usize = 10;
-            let mut buf: SmallVec<[DnsAuditRecord; BUF_SIZE]> = SmallVec::new();
+                const BUF_SIZE: usize = 10;
+                let mut buf: SmallVec<[DnsAuditRecord; BUF_SIZE]> = SmallVec::new();
 
-            while let Some(audit) = audit_rx.recv().await {
-                buf.push(audit);
-                if buf.len() == BUF_SIZE {
-                    if let Err(err) = record_audit_to_file(&mut audit_file, buf.as_slice()) {
-                        warn!("log audit failed {}", err)
+                while let Some(audit) = audit_rx.recv().await {
+                    buf.push(audit);
+                    if buf.len() == BUF_SIZE {
+                        if let Err(err) = record_audit_to_file(&mut audit_file, buf.as_slice()) {
+                            warn!("log audit failed {}", err)
+                        }
+                        if audit_console {
+                            for record in buf.iter() {
+                                println!("{}", record.to_string_without_date());
+                            }
+                        }
+                        buf.clear();
                     }
-                    buf.clear();
                 }
+            });
+        } else if audit_syslog {
+            #[cfg(unix)]
+            tokio::spawn(async move {
+                let formatter = syslog::Formatter3164 {
+                    facility: syslog::Facility::LOG_DAEMON,
+                    hostname: None,
+                    process: "smartdns-audit".to_string(),
+                    pid: std::process::id(),
+                };
+                let mut logger = syslog::unix(formatter).ok();
+
+                while let Some(audit) = audit_rx.recv().await {
+                    if let Some(logger) = logger.as_mut() {
+                        let _ = logger.info(&audit.to_string_without_date());
+                    }
+                }
+            });
+            #[cfg(not(unix))]
+            {
+                warn!("audit-syslog is only supported on unix");
+                drop(audit_rx);
             }
-        });
+        } else {
+            // 无磁盘审计：丢弃文件写入通道，避免通道无限堆积。
+            drop(audit_rx);
+        }
 
         Self {
             audit_sender: audit_tx,
+            query_log,
+            audit_soa,
+            audit_console,
         }
     }
 }
@@ -161,6 +276,25 @@ impl std::fmt::Display for DnsAuditRecord {
     }
 }
 
+/// 判断应答是否为“只有 SOA、没有任何地址记录”的空应答。
+fn is_soa_only(result: &Result<DnsResponse, DnsError>) -> bool {
+    let Ok(res) = result else {
+        return false;
+    };
+
+    let mut has_soa = false;
+    let mut has_ip = false;
+    for record in res.records() {
+        match record.record_type() {
+            RecordType::SOA => has_soa = true,
+            RecordType::A | RecordType::AAAA => has_ip = true,
+            _ => {}
+        }
+    }
+
+    has_soa && !has_ip
+}
+
 fn record_audit_to_file(
     audit_file: &mut MappedFile,
     audit_records: &[DnsAuditRecord],
@@ -183,12 +317,11 @@ fn record_audit_to_file(
                 "lookup_source",
             ])?;
 
-            audit_file.set_peamble(Some(
-                writer
-                    .into_inner()
-                    .expect("read csv peamble")
-                    .into_boxed_slice(),
-            ))
+            if let Ok(buf) = writer.into_inner() {
+                audit_file.set_peamble(Some(buf.into_boxed_slice()));
+            } else {
+                warn!("failed to flush csv preamble to audit file");
+            }
         }
 
         let mut writer = csv::Writer::from_writer(audit_file);
@@ -229,6 +362,7 @@ mod tests {
     use crate::libdns::proto::op::Query;
     use crate::libdns::proto::rr::{RData, RecordType};
     use std::io::Read;
+    use std::path::Path;
     use std::str::FromStr;
 
     use super::*;

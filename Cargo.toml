@@ -1,9 +1,9 @@
 [package]
 name = "smartdns"
-version = "0.13.1"
+version = "0.13.9"
 authors = ["YISH <mokeyish@hotmail.com>"]
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.95"
 
 keywords = ["DNS", "BIND", "dig", "SmartDNS", "Dnsmasq"]
 categories = ["network-programming"]
@@ -23,7 +23,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
 
 [features]
 
-default = ["common", "self-update" ]
+default = ["common", "self-update", "web-ui" ]
 
 homebrew = [ "common" ]
 
@@ -87,6 +87,11 @@ swagger-ui-embed = [
   "dep:utoipa-swagger-ui"
 ]
 
+web-ui = [
+  "dep:rust-embed",
+  "dep:mime_guess"
+]
+
 
 http_client = [
   "ureq"
@@ -145,6 +150,8 @@ tower-http = { version = "0.6.6", default-features = false, features = ["set-hea
 utoipa = { git = "https://github.com/mokeyish/utoipa.git", rev = "smartdns.1", package = "utoipa", features = ["axum_extras"] }
 utoipa-axum = { git = "https://github.com/mokeyish/utoipa.git", rev = "smartdns.1", package = "utoipa-axum", features = []}
 utoipa-swagger-ui = { git = "https://github.com/mokeyish/utoipa.git", rev = "smartdns.1", package = "utoipa-swagger-ui", optional = true, default-features = false, features = ["axum"] }
+rust-embed = { version = "8", optional = true, features = ["axum"] }
+mime_guess = { version = "2", optional = true }
 
 # serde
 serde = { version = "1.0", optional = true, features = ["derive"]}
@@ -232,6 +239,8 @@ local-ip-address = "0.6.1"
 console = { version = "0.15.8", optional = true }
 rangemap = "1.5.1"
 mac-addr = "0.3.0"
+rcgen = { version = "0.14.10", features = ["pem"] }
+time = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 uzers = { version = "0.12", default-features = false }
@@ -256,6 +265,9 @@ self_update = { version = "0.42.0", default-features = false, features=["archive
 self-replace = { version = "1.3.7", optional = true }
 same-file = { version = "1", optional = true }
 
+[target."cfg(unix)".dependencies]
+syslog = "7"
+
 
 
 [build-dependencies]
@@ -275,6 +287,7 @@ bindgen = "0.72"
 # Dev-dependencies are not used when compiling a package for building, but are used for compiling tests, examples, and benchmarks.
 [dev-dependencies]
 indoc = "2"
+tokio = { version = "1.46", features = ["full"] }
 # reqwest = { version = "0.12", default-features = false, features = [
 #   "blocking",
 #   "rustls-tls",

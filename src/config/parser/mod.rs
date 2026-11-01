@@ -23,6 +23,10 @@ mod ip_net;
 mod ip_set;
 mod iporset;
 // mod line;
+mod group_match;
+mod ip_rule;
+mod ipset_name;
+mod local_domain;
 mod log_level;
 mod nameserver;
 mod nftset;
@@ -32,9 +36,11 @@ mod path;
 mod proxy_config;
 mod record_type;
 mod response_mode;
+mod san_list;
 mod speed_mode;
 mod srv;
 mod svcb;
+mod txt;
 
 use super::*;
 
@@ -96,12 +102,14 @@ pub enum ConfigItem {
     CacheFile(PathBuf),
     CachePersist(bool),
     CacheSize(usize),
+    CacheMemSize(usize),
     CacheCheckpointTime(u64),
     CaFile(PathBuf),
     CaPath(PathBuf),
     ClientRule(ClientRule),
     CNAME(ConfigForDomain<CNameRule>),
     SrvRecord(ConfigForDomain<SRV>),
+    TxtRecord(ConfigForDomain<TxtRecord>),
     GroupBegin(String),
     GroupEnd,
     HttpsRecord(ConfigForDomain<HttpsRecordRule>),
@@ -118,6 +126,31 @@ pub enum ConfigItem {
     ExpandPtrFromAddress(bool),
     ForceAAAASOA(bool),
     ForceHTTPSSOA(bool),
+    ForceNoCNAME(bool),
+    LocalPtrEnable(bool),
+    MaxQueryLimit(usize),
+    SocketBuffSize(usize),
+    DataDir(PathBuf),
+    LocalDomain(LocalDomain),
+    OdhcpdLeaseFile(PathBuf),
+    GroupMatch(GroupMatch),
+    IpRule(IpRule),
+    IpSet(ConfigForDomain<IpSetName>),
+    IpSetTimeoutEnable(bool),
+    IpSetNoSpeed(String),
+    AclEnable(bool),
+    BindCertGenerate(bool),
+    BindCertRootKeyFile(PathBuf),
+    BindCertSan(san_list::SanList),
+    BindCertValidityDays(u64),
+    LogSyslog(bool),
+    AuditSyslog(bool),
+    NftsetNoSpeed(nftset::NftSetList),
+    DebugSaveFailPacket(bool),
+    DebugSaveFailPacketDir(PathBuf),
+    LogColor(bool),
+    AuditSoa(bool),
+    AuditConsole(bool),
     ForceQtypeSoa(RecordType),
     ForwardRule(ForwardRule),
     HostsFile(glob::Pattern),
@@ -134,12 +167,15 @@ pub enum ConfigItem {
     MaxReplyIpNum(u8),
     MdnsLookup(bool),
     NftSet(ConfigForDomain<Vec<ConfigForIP<NFTsetConfig>>>),
+    NftsetTimeoutEnable(bool),
+    NftsetDebug(bool),
     NumWorkers(usize),
     PrefetchDomain(bool),
     ProxyConfig(NamedProxyConfig),
     ResolvHostname(bool),
     ResponseMode(ResponseMode),
     ServeExpired(bool),
+    ServeExpiredPrefetchTime(u64),
     ServeExpiredTtl(u64),
     ServeExpiredReplyTtl(u64),
     Server(NameServerInfo),
@@ -163,82 +199,138 @@ impl std::fmt::Display for ConfigItem {
             ConfigItem::Address(rule) => {
                 write!(f, "address {rule}")?;
             }
-            ConfigItem::AuditEnable(_) => todo!(),
-            ConfigItem::AuditFile(_) => todo!(),
-            ConfigItem::AuditFileMode(_) => todo!(),
-            ConfigItem::AuditNum(_) => todo!(),
-            ConfigItem::AuditSize(_) => todo!(),
-            ConfigItem::BindCertFile(_) => todo!(),
-            ConfigItem::BindCertKeyFile(_) => todo!(),
-            ConfigItem::BindCertKeyPass(_) => todo!(),
-            ConfigItem::BlacklistIp(_) => todo!(),
-            ConfigItem::BogusNxDomain(_) => todo!(),
-            ConfigItem::CacheFile(_) => todo!(),
-            ConfigItem::CachePersist(_) => todo!(),
-            ConfigItem::CacheSize(_) => todo!(),
-            ConfigItem::CacheCheckpointTime(_) => todo!(),
-            ConfigItem::CaFile(_) => todo!(),
-            ConfigItem::CaPath(_) => todo!(),
-            ConfigItem::ClientRule(_) => todo!(),
-            ConfigItem::CNAME(_) => todo!(),
-            ConfigItem::SrvRecord(_) => todo!(),
-            ConfigItem::GroupBegin(_) => todo!(),
-            ConfigItem::GroupEnd => todo!(),
-            ConfigItem::HttpsRecord(_) => todo!(),
-            ConfigItem::ConfFile(_) => todo!(),
-            ConfigItem::DnsmasqLeaseFile(_) => todo!(),
-            ConfigItem::Domain(_) => todo!(),
-            ConfigItem::DomainRule(_) => todo!(),
-            ConfigItem::DomainSetProvider(_) => todo!(),
-            ConfigItem::DualstackIpAllowForceAAAA(_) => todo!(),
-            ConfigItem::DualstackIpSelection(_) => todo!(),
-            ConfigItem::DualstackIpSelectionThreshold(_) => todo!(),
-            ConfigItem::EdnsClientSubnet(_) => todo!(),
-            ConfigItem::ExpandPtrFromAddress(_) => todo!(),
-            ConfigItem::ForceAAAASOA(_) => todo!(),
-            ConfigItem::ForceHTTPSSOA(_) => todo!(),
-            ConfigItem::ForceQtypeSoa(_) => todo!(),
+            ConfigItem::AuditEnable(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditFileMode(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditNum(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditSize(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertKeyFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertKeyPass(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BlacklistIp(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BogusNxDomain(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CacheFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CachePersist(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CacheSize(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CacheMemSize(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CacheCheckpointTime(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::CaFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CaPath(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ClientRule(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::CNAME(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::SrvRecord(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::TxtRecord(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::GroupBegin(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::GroupEnd => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::HttpsRecord(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ConfFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DnsmasqLeaseFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::Domain(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DomainRule(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DomainSetProvider(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DualstackIpAllowForceAAAA(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::DualstackIpSelection(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::DualstackIpSelectionThreshold(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::EdnsClientSubnet(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ExpandPtrFromAddress(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::ForceAAAASOA(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ForceHTTPSSOA(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ForceNoCNAME(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LocalPtrEnable(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::MaxQueryLimit(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::SocketBuffSize(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DataDir(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LocalDomain(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::OdhcpdLeaseFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::GroupMatch(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IpRule(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IpSet(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IpSetTimeoutEnable(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::IpSetNoSpeed(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AclEnable(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertGenerate(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertRootKeyFile(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::BindCertSan(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::BindCertValidityDays(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::LogSyslog(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditSyslog(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::NftsetNoSpeed(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::DebugSaveFailPacket(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::DebugSaveFailPacketDir(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::LogColor(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditSoa(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::AuditConsole(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ServeExpiredPrefetchTime(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::ForceQtypeSoa(_) => write!(f, "# unsupported config item: {:?}", self)?,
             ConfigItem::ForwardRule(rule) => {
                 write!(f, "nameserver {rule}")?;
             }
-            ConfigItem::HostsFile(_) => todo!(),
-            ConfigItem::IgnoreIp(_) => todo!(),
-            ConfigItem::Listener(_) => todo!(),
-            ConfigItem::LocalTtl(_) => todo!(),
-            ConfigItem::LogConsole(_) => todo!(),
-            ConfigItem::LogNum(_) => todo!(),
-            ConfigItem::LogSize(_) => todo!(),
-            ConfigItem::LogLevel(_) => todo!(),
-            ConfigItem::LogFile(_) => todo!(),
-            ConfigItem::LogFileMode(_) => todo!(),
-            ConfigItem::LogFilter(_) => todo!(),
-            ConfigItem::MaxReplyIpNum(_) => todo!(),
-            ConfigItem::MdnsLookup(_) => todo!(),
-            ConfigItem::NftSet(_) => todo!(),
-            ConfigItem::NumWorkers(_) => todo!(),
-            ConfigItem::PrefetchDomain(_) => todo!(),
-            ConfigItem::ProxyConfig(_) => todo!(),
-            ConfigItem::ResolvHostname(_) => todo!(),
-            ConfigItem::ResponseMode(_) => todo!(),
-            ConfigItem::ServeExpired(_) => todo!(),
-            ConfigItem::ServeExpiredTtl(_) => todo!(),
-            ConfigItem::ServeExpiredReplyTtl(_) => todo!(),
+            ConfigItem::HostsFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IgnoreIp(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::Listener(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LocalTtl(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogConsole(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogNum(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogSize(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogLevel(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogFileMode(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::LogFilter(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::MaxReplyIpNum(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::MdnsLookup(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::NftSet(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::NftsetTimeoutEnable(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
+            ConfigItem::NftsetDebug(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::NumWorkers(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::PrefetchDomain(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ProxyConfig(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ResolvHostname(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ResponseMode(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ServeExpired(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ServeExpiredTtl(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ServeExpiredReplyTtl(_) => {
+                write!(f, "# unsupported config item: {:?}", self)?
+            }
             ConfigItem::Server(c) => {
                 write!(f, "server {c}")?;
             }
-            ConfigItem::ServerName(_) => todo!(),
-            ConfigItem::ResolvFile(_) => todo!(),
-            ConfigItem::RrTtl(_) => todo!(),
-            ConfigItem::RrTtlMin(_) => todo!(),
-            ConfigItem::RrTtlMax(_) => todo!(),
-            ConfigItem::RrTtlReplyMax(_) => todo!(),
-            ConfigItem::SpeedMode(_) => todo!(),
-            ConfigItem::TcpIdleTime(_) => todo!(),
-            ConfigItem::WhitelistIp(_) => todo!(),
-            ConfigItem::User(_) => todo!(),
-            ConfigItem::IpSetProvider(_) => todo!(),
-            ConfigItem::IpAlias(_) => todo!(),
-            ConfigItem::Dns64(_) => todo!(),
+            ConfigItem::ServerName(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::ResolvFile(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::RrTtl(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::RrTtlMin(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::RrTtlMax(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::RrTtlReplyMax(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::SpeedMode(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::TcpIdleTime(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::WhitelistIp(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::User(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IpSetProvider(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::IpAlias(_) => write!(f, "# unsupported config item: {:?}", self)?,
+            ConfigItem::Dns64(_) => write!(f, "# unsupported config item: {:?}", self)?,
         }
         Ok(())
     }
@@ -328,6 +420,7 @@ fn parse_line<'a>(input: &'a str) -> IResult<&'a str, ConfigLine<'a>> {
         map(config("cache-file"), ConfigItem::CacheFile),
         map(config("cache-persist"), ConfigItem::CachePersist),
         map(config("cache-size"), ConfigItem::CacheSize),
+        map(config("cache-mem-size"), ConfigItem::CacheMemSize),
         map(
             config("cache-checkpoint-time"),
             ConfigItem::CacheCheckpointTime,
@@ -375,6 +468,51 @@ fn parse_line<'a>(input: &'a str) -> IResult<&'a str, ConfigLine<'a>> {
         map(config("hosts-file"), ConfigItem::HostsFile),
     ));
 
+    let group2b = alt((
+        map(config("force-no-CNAME"), ConfigItem::ForceNoCNAME),
+        map(config("local-ptr-enable"), ConfigItem::LocalPtrEnable),
+        map(config("max-query-limit"), ConfigItem::MaxQueryLimit),
+        map(config("nftset-timeout"), ConfigItem::NftsetTimeoutEnable),
+        map(config("nftset-debug"), ConfigItem::NftsetDebug),
+        map(config("socket-buff-size"), ConfigItem::SocketBuffSize),
+        map(config("data-dir"), ConfigItem::DataDir),
+        map(config("log-color"), ConfigItem::LogColor),
+        map(config("audit-SOA"), ConfigItem::AuditSoa),
+        map(config("audit-console"), ConfigItem::AuditConsole),
+        map(config("local-domain"), ConfigItem::LocalDomain),
+        map(config("odhcpd-lease-file"), ConfigItem::OdhcpdLeaseFile),
+    ));
+
+    let group2c = alt((
+        map(config("group-match"), ConfigItem::GroupMatch),
+        map(config("ip-rules"), ConfigItem::IpRule),
+        map(config("ipset"), ConfigItem::IpSet),
+        map(config("ipset-timeout"), ConfigItem::IpSetTimeoutEnable),
+        map(config("ipset-no-speed"), ConfigItem::IpSetNoSpeed),
+        map(config("acl-enable"), ConfigItem::AclEnable),
+        map(config("bind-cert-generate"), ConfigItem::BindCertGenerate),
+        map(
+            config("bind-cert-root-key-file"),
+            ConfigItem::BindCertRootKeyFile,
+        ),
+        map(config("bind-cert-san"), ConfigItem::BindCertSan),
+        map(
+            config("bind-cert-validity-days"),
+            ConfigItem::BindCertValidityDays,
+        ),
+        map(config("log-syslog"), ConfigItem::LogSyslog),
+        map(config("audit-syslog"), ConfigItem::AuditSyslog),
+        map(config("nftset-no-speed"), ConfigItem::NftsetNoSpeed),
+        map(
+            config("debug-save-fail-packet"),
+            ConfigItem::DebugSaveFailPacket,
+        ),
+        map(
+            config("debug-save-fail-packet-dir"),
+            ConfigItem::DebugSaveFailPacketDir,
+        ),
+    ));
+
     let group3 = alt((
         map(config("https-record"), ConfigItem::HttpsRecord),
         map(config("ignore-ip"), ConfigItem::IgnoreIp),
@@ -407,8 +545,13 @@ fn parse_line<'a>(input: &'a str) -> IResult<&'a str, ConfigLine<'a>> {
             ConfigItem::ServeExpiredReplyTtl,
         ),
         map(config("serve-expired-ttl"), ConfigItem::ServeExpiredTtl),
+        map(
+            config("serve-expired-prefetch-time"),
+            ConfigItem::ServeExpiredPrefetchTime,
+        ),
         map(config("serve-expired"), ConfigItem::ServeExpired),
         map(config("srv-record"), ConfigItem::SrvRecord),
+        map(config("txt-record"), ConfigItem::TxtRecord),
         map(config("resolv-hostname"), ConfigItem::ResolvHostname),
         map(config("tcp-idle-time"), ConfigItem::TcpIdleTime),
         map(config("nftset"), ConfigItem::NftSet),
@@ -423,7 +566,7 @@ fn parse_line<'a>(input: &'a str) -> IResult<&'a str, ConfigLine<'a>> {
         map(NomParser::parse, ConfigItem::Server),
     ));
 
-    let group = alt((group1, group2, group3, group4, group5));
+    let group = alt((group1, group2, group2b, group2c, group3, group4, group5));
 
     alt((
         map(
@@ -460,6 +603,21 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn test_config_item_unsupported_display_no_panic() {
+        // 未实现 Display 的变体（原 todo!）现在输出安全占位注释，避免 API 写回时 panic。
+        for item in [
+            ConfigItem::CacheSize(1024usize),
+            ConfigItem::AuditEnable(true),
+        ] {
+            let out = format!("{item}");
+            assert!(
+                out.starts_with('#'),
+                "未实现 Display 的 ConfigItem 应输出安全占位而非 panic，got: {out}"
+            );
+        }
+    }
 
     #[test]
     fn test_nftset() {

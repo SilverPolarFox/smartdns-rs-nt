@@ -49,44 +49,60 @@ pub fn serve(
     use std::time::Duration;
 
     let dns_handle = handle.with_new_opt(bind_addr_config.server_opts().clone());
+    let socket_buff_size = cfg.socket_buff_size();
 
     fn create_cert_resolver(
+        cfg: &RuntimeConfig,
         ssl_config: &SslConfig,
         certificate_file: Option<&Path>,
         certificate_key_file: Option<&Path>,
         typ: &'static str,
     ) -> Result<Arc<TlsServerCertResolver>, crate::Error> {
-        let certificate_file = ssl_config
-            .certificate
-            .as_deref()
-            .or(certificate_file)
-            .ok_or(crate::Error::CertificatePathNotDefined(typ))?;
-        let certificate_key_file = ssl_config
+        let configured_cert = ssl_config.certificate.as_deref().or(certificate_file);
+        let configured_key = ssl_config
             .certificate_key
             .as_deref()
-            .or(certificate_key_file)
+            .or(certificate_key_file);
+
+        // bind-cert-generate：未配置证书时生成（或复用）自签证书
+        let generated = if (configured_cert.is_none() || configured_key.is_none())
+            && cfg.bind_cert_generate()
+        {
+            Some(crate::rustls_self_signed::generate(cfg)?)
+        } else {
+            None
+        };
+
+        let certificate_file = configured_cert
+            .map(Path::to_path_buf)
+            .or_else(|| generated.as_ref().map(|(cert, _)| cert.clone()))
+            .ok_or(crate::Error::CertificatePathNotDefined(typ))?;
+        let certificate_key_file = configured_key
+            .map(Path::to_path_buf)
+            .or_else(|| generated.as_ref().map(|(_, key)| key.clone()))
             .ok_or(crate::Error::CertificateKeyPathNotDefined(typ))?;
-        let resolver = TlsServerCertResolver::new(certificate_file, certificate_key_file)?;
+
+        let resolver = TlsServerCertResolver::new(&certificate_file, &certificate_key_file)?;
         Ok(Arc::new(resolver))
     }
 
     let token = match bind_addr_config {
         BindAddrConfig::Udp(bind_addr_config) => {
             let socket = bind_to(
-                setup_udp_socket,
+                |addr, dev| setup_udp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 "UDP",
-            );
+            )?;
             udp::serve(socket, dns_handle)
         }
         BindAddrConfig::Tcp(bind_addr_config) => {
             let listener = bind_to(
-                setup_tcp_socket,
+                |addr, dev| setup_tcp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 "TCP",
-            );
+            )?;
             tcp::serve(listener, dns_handle, Duration::from_secs(idle_time))
         }
         #[cfg(feature = "dns-over-tls")]
@@ -95,6 +111,7 @@ pub fn serve(
             let ssl_config = &bind_addr_config.ssl_config;
 
             let server_cert_resolver = create_cert_resolver(
+                cfg,
                 ssl_config,
                 certificate_file,
                 certificate_key_file,
@@ -102,11 +119,11 @@ pub fn serve(
             )?;
 
             let listener = bind_to(
-                setup_tcp_socket,
+                |addr, dev| setup_tcp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 LISTENER_TYPE,
-            );
+            )?;
 
             tls::serve(
                 listener,
@@ -119,11 +136,11 @@ pub fn serve(
             const LISTENER_TYPE: &str = "DNS over HTTP";
 
             let listener = bind_to(
-                setup_tcp_socket,
+                |addr, dev| setup_tcp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 LISTENER_TYPE,
-            );
+            )?;
 
             let app = app.clone();
 
@@ -135,6 +152,7 @@ pub fn serve(
             let ssl_config = &bind_addr_config.ssl_config;
 
             let server_cert_resolver = create_cert_resolver(
+                cfg,
                 ssl_config,
                 certificate_file,
                 certificate_key_file,
@@ -142,11 +160,11 @@ pub fn serve(
             )?;
 
             let listener = bind_to(
-                setup_tcp_socket,
+                |addr, dev| setup_tcp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 LISTENER_TYPE,
-            );
+            )?;
 
             let app = app.clone();
 
@@ -164,6 +182,7 @@ pub fn serve(
             let ssl_config = &bind_addr_config.ssl_config;
 
             let server_cert_resolver = create_cert_resolver(
+                cfg,
                 ssl_config,
                 certificate_file,
                 certificate_key_file,
@@ -171,11 +190,11 @@ pub fn serve(
             )?;
 
             let listener = bind_to(
-                setup_udp_socket,
+                |addr, dev| setup_udp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 LISTENER_TYPE,
-            );
+            )?;
 
             let app = app.clone();
             h3::serve(app, listener, dns_handle, server_cert_resolver)?
@@ -186,6 +205,7 @@ pub fn serve(
             let ssl_config = &bind_addr_config.ssl_config;
 
             let server_cert_resolver = create_cert_resolver(
+                cfg,
                 ssl_config,
                 certificate_file,
                 certificate_key_file,
@@ -193,11 +213,11 @@ pub fn serve(
             )?;
 
             let listener = bind_to(
-                setup_udp_socket,
+                |addr, dev| setup_udp_socket(addr, dev, socket_buff_size),
                 bind_addr_config.sock_addr(),
                 bind_addr_config.device(),
                 LISTENER_TYPE,
-            );
+            )?;
 
             quic::serve(
                 listener,
@@ -252,6 +272,17 @@ pub type IncomingDnsMessage = (SerialMessage, ServerOpts, oneshot::Sender<Serial
 
 pub type IncomingDnsRequest = mpsc::UnboundedReceiver<IncomingDnsMessage>;
 
+/// 用 REFUSED 应答一个无法进入处理链的请求（并发超限、处理通道已关闭等）。
+pub fn refused_response(message: SerialMessage) -> SerialMessage {
+    let addr = message.addr();
+    let protocol = message.protocol();
+    let mut response_message = DnsRequest::try_from(message)
+        .map(|req| req.to_response())
+        .unwrap_or_else(|_| Message::query().to_response());
+    response_message.set_response_code(ResponseCode::Refused);
+    SerialMessage::raw(response_message, addr, protocol)
+}
+
 impl DnsHandle {
     pub fn new() -> (IncomingDnsRequest, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -269,14 +300,7 @@ impl DnsHandle {
         let (tx, rx) = oneshot::channel();
 
         if let Err(err) = self.sender.send((message, self.opts.clone(), tx)) {
-            let message = err.0.0;
-            let addr = message.addr();
-            let protocol = message.protocol();
-            let mut response_message = DnsRequest::try_from(message)
-                .map(|req| req.to_response())
-                .unwrap_or_else(|_| Message::query().to_response());
-            response_message.set_response_code(ResponseCode::Refused);
-            return SerialMessage::raw(response_message, addr, protocol);
+            return refused_response(err.0.0);
         }
 
         match rx.await {

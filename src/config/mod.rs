@@ -61,6 +61,7 @@ pub type DomainRules = Vec<ConfigForDomain<DomainRule>>;
 pub type CNameRules = Vec<ConfigForDomain<CNameRule>>;
 pub type SrvRecords = Vec<ConfigForDomain<SRV>>;
 pub type HttpsRecords = Vec<ConfigForDomain<HttpsRecordRule>>;
+pub type TxtRecords = Vec<ConfigForDomain<TxtRecord>>;
 
 #[derive(Default)]
 pub struct Config {
@@ -85,6 +86,21 @@ pub struct Config {
     pub hosts_file: Option<glob::Pattern>,
 
     pub expand_ptr_from_address: Option<bool>,
+
+    /// answer PTR for local addresses from the hosts file
+    ///
+    /// local-ptr-enable [yes|no]
+    pub local_ptr_enable: Option<bool>,
+
+    /// maximum number of concurrent queries, 0 means unlimited
+    ///
+    /// max-query-limit [num]
+    pub max_query_limit: Option<usize>,
+
+    /// socket send/recv buffer size in bytes for listeners
+    ///
+    /// socket-buff-size [bytes]
+    pub socket_buff_size: Option<usize>,
 
     /// dns server run user
     ///
@@ -115,6 +131,51 @@ pub struct Config {
     pub tcp_idle_time: Option<u64>,
 
     pub cache: CacheConfig,
+
+    /// generate a self-signed certificate when no bind certificate is configured
+    ///
+    /// bind-cert-generate [yes|no]
+    pub bind_cert_generate: Option<bool>,
+
+    /// root CA private key (PEM) used to sign the generated certificate
+    ///
+    /// bind-cert-root-key-file [path]
+    pub bind_cert_root_key_file: Option<PathBuf>,
+
+    /// additional SANs for the generated certificate
+    ///
+    /// bind-cert-san [name|name,...]
+    pub bind_cert_san: Option<Vec<String>>,
+
+    /// validity of the generated certificate in days
+    ///
+    /// bind-cert-validity-days [num]
+    pub bind_cert_validity_days: Option<u64>,
+
+    /// base directory for runtime data files (persisted cache)
+    ///
+    /// data-dir [path]
+    pub data_dir: Option<PathBuf>,
+
+    /// dump failed query packets for debugging
+    ///
+    /// debug-save-fail-packet [yes|no]
+    pub debug_save_fail_packet: Option<bool>,
+
+    /// directory for dumped packets, defaults to /tmp/smartdns
+    ///
+    /// debug-save-fail-packet-dir [path]
+    pub debug_save_fail_packet_dir: Option<PathBuf>,
+
+    /// odhcpd DHCPv6 lease file (OpenWrt)
+    ///
+    /// odhcpd-lease-file [path]
+    pub odhcpd_lease_file: Option<PathBuf>,
+
+    /// local domain suffix resolved through the mDNS group and expanded on hosts entries
+    ///
+    /// local-domain [domain|-]
+    pub local_domain: Option<Name>,
 
     /// List of hosts that supply bogus NX domain results
     pub bogus_nxdomain: Vec<IpOrSet>,
@@ -148,6 +209,21 @@ pub struct Config {
     ///
     /// force-HTTPS-SOA [yes|no]
     pub force_https_soa: Option<bool>,
+
+    /// do not include CNAME records in the answer, only the resolved addresses
+    ///
+    /// force-no-CNAME [yes|no]
+    pub force_no_cname: Option<bool>,
+
+    /// refuse clients that do not match any client-rules entry
+    ///
+    /// acl-enable [yes|no]
+    pub acl_enable: Option<bool>,
+
+    /// per-client-CIDR upstream filtering rules
+    ///
+    /// ip-rules [cidr] [-blacklist-ip|-whitelist-ip|-bogus-nxdomain|-ignore-ip]
+    pub ip_rules: Vec<IpRule>,
 
     /// force specific qtype return soa
     ///
@@ -223,6 +299,31 @@ pub struct Config {
     pub proxy_servers: HashMap<String, ProxyConfig>,
 
     pub nftsets: Vec<ConfigForDomain<Vec<ConfigForIP<NFTsetConfig>>>>,
+
+    /// enable timeout (ttl * 3) on ipset entries
+    ///
+    /// ipset-timeout [yes|no]
+    pub ipset_timeout_enable: Option<bool>,
+
+    /// ipset receiving addresses that fail the speed check
+    ///
+    /// ipset-no-speed [setname]
+    pub ipset_no_speed: Option<String>,
+
+    /// nft set receiving addresses that fail the speed check
+    ///
+    /// nftset-no-speed [#4:inet#table#set|#6:inet#table#set|...]
+    pub nftset_no_speed: Option<Vec<ConfigForIP<NFTsetConfig>>>,
+
+    /// set a timeout (ttl * 3) on nftset elements instead of leaving them permanent
+    ///
+    /// nftset-timeout [yes|no]
+    pub nftset_timeout_enable: Option<bool>,
+
+    /// verbose logging for nftset operations
+    ///
+    /// nftset-debug [yes|no]
+    pub nftset_debug: Option<bool>,
 
     pub resolv_file: Option<PathBuf>,
     pub domain_set_providers: HashMap<String, Vec<DomainSetProvider>>,
@@ -399,6 +500,39 @@ pub enum HttpsRecordRule {
     },
     RecordData(HTTPS),
 }
+
+/// ipset 名称（`ipset /domain/name` 的配置值）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct IpSetName(pub String);
+
+pub type IpsetRules = Vec<ConfigForDomain<IpSetName>>;
+
+/// 按客户端 CIDR 生效的上游过滤规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpRule {
+    pub net: ipnet::IpNet,
+    pub blacklist: bool,
+    pub whitelist: bool,
+    pub bogus_nxdomain: bool,
+    pub ignore: bool,
+}
+
+/// `group-match -g <group> -d <domain> -c <cidr>` grouping sugar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMatch {
+    pub group: String,
+    pub domains: Vec<Domain>,
+    pub clients: Vec<Client>,
+}
+
+/// `local-domain <domain>` wrapper so `-` can clear the setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LocalDomain(pub Option<Name>);
+
+/// Static TXT record: `txt-record /domain/text`.
+/// Multiple lines for one domain accumulate into a single TXT RRset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct TxtRecord(pub String);
 
 macro_rules! impl_from_str {
     ($($type:ty),*) => {

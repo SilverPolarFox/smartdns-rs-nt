@@ -3,25 +3,29 @@ use std::{
     ops::Deref,
     path::PathBuf,
     slice::Iter,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::third_ext::FutureJoinAllExt;
 use crate::{
     dns::DnsResponse,
     dns_conf::NameServerInfo,
     dns_error::LookupError,
-    log::{self, debug, info, warn},
+    log::{self, debug, info, trace, warn},
     proxy::ProxyConfig,
     rustls::TlsClientConfigBundle,
 };
 
 use crate::libdns::{
     proto::{
-        DnsHandle, ProtoError,
-        op::{Edns, Message, Query},
+        DnsHandle, ProtoError, ProtoErrorKind,
+        op::{Edns, Message, Query, ResponseCode},
         rr::{
             Record, RecordType,
             domain::{IntoName, Name},
@@ -38,6 +42,101 @@ pub use name_server_group::NameServerGroup;
 /// Maximum TTL as defined in https://tools.ietf.org/html/rfc2181, 2147483647
 ///   Setting this to a value of 1 day, in seconds
 pub const MAX_TTL: u32 = 86400_u32;
+
+/// 单个 NameServer 的并发查询限制器。
+///
+/// hickory-proto 的 DnsMultiplexer 在活跃请求超过 CHANNEL_BUFFER_SIZE(32) 时
+/// 返回 ProtoErrorKind::Busy("resource too busy")。
+///
+/// 并发数设为 12：实测数据表明降至 8 反而恶化 busy 率 3 倍（342/h→1057/h），
+/// 因为较低并发降低吞吐、延长排队，使僵尸请求占比升高。12 在个人电脑场景下
+/// 兼顾吞吐与槽位余量。
+///
+/// 注意：真正的僵尸请求根因已在 NameServerGroup::lookup 中通过 detached task
+/// 消除——查询自然完成后释放 DnsMultiplexer 槽位，不再依赖 cancel+retry。
+const PER_NAMESERVER_CONCURRENCY: usize = 12;
+
+/// 单次上游查询的应用层超时（含 TCP/TLS/QUIC 连接建立阶段）。
+///
+/// hickory 的 `ResolverOpts.timeout` 仅约束“已建立连接后的报文交换”，
+/// 而 DoH/DoT/DoH3 的**连接建立**阶段不受其约束。上游不可达时，
+/// 单个查询会一直挂到操作系统级 TCP 超时（分钟级），这正是日志里
+/// 出现 500~780s 挂起的根因。这里用 `tokio::time::timeout` 包裹底层
+/// `send`，从根上把单次查询的最大耗时限制在 `NS_QUERY_TIMEOUT` 内。
+const NS_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 单个上游 `lookup` 的整体截止时间。即使发生可重试错误（Busy / 连接断开），
+/// 重试也不会超过此时间，避免退避重试风暴把整体延迟拖到几十秒。
+const NS_LOOKUP_DEADLINE: Duration = Duration::from_secs(8);
+
+/// 熔断：单个上游连续失败达到该次数后进入冷却，期间不再发查询。
+///
+/// 配合 NS_COOLDOWN 使用，避免对已确认不可达/极慢的上游反复空耗
+/// NS_QUERY_TIMEOUT(3s) + 占用信号量槽位 + 刷 debug 日志。
+const NS_FAIL_THRESHOLD: u32 = 3;
+
+/// 熔断冷却时长。冷却期内该上游被整体跳过，冷却结束后才允许再试一次。
+const NS_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// 熔断半开探测的最小间隔。
+///
+/// 整组上游同时冷却时，每 `NS_PROBE_INTERVAL` 才放行一次真实探测：既能在网络恢复后
+/// 5s 内自愈，又不会让上游长时间不可用时每条查询都白等一个 `NS_QUERY_TIMEOUT`。
+const NS_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 检测 ProtoError 是否为 `Busy`（上游多路复用器瞬时过载）。
+///
+/// Busy 与连接断开/资源耗尽不同：它是“当前槽位已满”的瞬时信号。
+/// 此时重试不仅无益（槽位仍满，重试必再次 Busy），还会让 hickory 把本上游标记为
+/// Failed 并在下次查询时强制重连（触发全局 200ms socket 速率限制 + TLS 握手），
+/// 形成“busy → 重连 → 更慢 → 更 busy”的恶性循环。因此 busy 应快速跳过本上游，
+/// 交由 `NameServerGroup` 转向下一个上游，而不是在本上游上空耗。
+fn is_busy(err: &ProtoError) -> bool {
+    matches!(err.kind(), ProtoErrorKind::Busy)
+}
+
+/// 上游返回的否定应答（NXDOMAIN / NODATA）。
+///
+/// hickory 把这类应答转成 `ProtoErrorKind::NoRecordsFound`，因此在类型上是个
+/// `Err`，但它是上游**正常且正确**的回答：域名确实不存在，或该类型无记录。
+///
+/// 必须与"上游故障"区分开：家庭网络里否定应答占比极高（双栈客户端的 AAAA 查询、
+/// PT 站 tracker 域名等），若计入熔断失败计数，连续 3 个不存在的域名就会让健康
+/// 上游冷却 30s。实测后果：三个上游被同一批 NXDOMAIN 同步打进冷却，整条查询链
+/// 在 µs 级返回 `no connections available`（客户端拿到 SERVFAIL），或只剩最慢的
+/// 一个上游可用（尾延迟 1~8s）。
+fn is_negative_answer(err: &ProtoError) -> bool {
+    match err.kind() {
+        ProtoErrorKind::NoRecordsFound(no_records) => {
+            matches!(
+                no_records.response_code,
+                ResponseCode::NoError | ResponseCode::NXDomain
+            )
+        }
+        _ => false,
+    }
+}
+
+/// 检测 ProtoError 是否可重试（连接断开、资源耗尽等临时性错误）。
+///
+/// 通过匹配 `ProtoErrorKind` 判断，避免对错误字符串/OS 码做脆弱嗅探。
+/// 可重试的错误类型：
+/// - `ProtoErrorKind::Canceled`：连接断开导致待处理请求被取消
+///   （旧实现靠嗅探 "receiver was canceled" 字符串，现直接匹配枚举）
+/// - `ProtoErrorKind::Io` 且为 OS 资源耗尽码（WSAENOBUFS=10055 / ENOBUFS=105）
+///
+/// 注意：`ProtoErrorKind::Busy` 不再视为可重试——见 `is_busy` 说明，busy 应快速跳过。
+fn is_retryable(err: &ProtoError) -> bool {
+    match err.kind() {
+        // 连接断开导致待处理请求被取消，重试时创建新连接。
+        ProtoErrorKind::Canceled(_) => true,
+        // IO 错误中的 OS 资源耗尽码（缓冲区/端口耗尽），属临时性。
+        ProtoErrorKind::Io(io_err) => {
+            io_err.raw_os_error() == Some(10055) || io_err.raw_os_error() == Some(105)
+        }
+        _ => false,
+    }
+}
 
 #[derive(Default)]
 pub struct DnsClientBuilder {
@@ -102,9 +201,16 @@ impl DnsClientBuilder {
                 let proxy = server_config
                     .proxy
                     .as_deref()
-                    .map(|n| proxies.get(n))
-                    .unwrap_or_default()
-                    .cloned();
+                    .and_then(|n| match proxies.get(n) {
+                        Some(p) => Some(p.clone()),
+                        None => {
+                            warn!(
+                                "proxy '{}' referenced by upstream {} not found, ignoring",
+                                n, server_config.server
+                            );
+                            None
+                        }
+                    });
                 match NameServer::new(
                     server_config.clone(),
                     proxy,
@@ -230,6 +336,7 @@ impl DnsClientBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct DnsClient {
     default: Arc<NameServerGroup>,
     bootstrap: Arc<BootstrapResolver>,
@@ -239,6 +346,16 @@ pub struct DnsClient {
 impl DnsClient {
     pub fn builder() -> DnsClientBuilder {
         DnsClientBuilder::default()
+    }
+
+    /// 默认上游组（公开的只读访问，避免与 `Deref` 目标字段冲突）。
+    pub fn default_server_group(&self) -> Arc<NameServerGroup> {
+        self.default.clone()
+    }
+
+    /// 命名上游组映射（公开的只读访问）。
+    pub fn named_server_groups(&self) -> &HashMap<String, Arc<NameServerGroup>> {
+        &self.servers
     }
 
     pub async fn default(&self) -> Arc<NameServerGroup> {
@@ -380,6 +497,36 @@ mod name_server_group {
             self.servers.is_empty()
         }
 
+        /// 熔断半开：整组上游都在冷却时清空计数，让本轮真实探测一次。
+        ///
+        /// 冷却只该省掉"明知会超时"的空耗，不该把整组锁死：整组同时冷却通常意味着
+        /// 那批失败来自同一个瞬时故障，必须真实探测才能及时恢复。否则网络恢复后
+        /// 客户端还要在整个冷却窗口里继续吃 SERVFAIL。
+        ///
+        /// 探测按 `NS_PROBE_INTERVAL` 限速：上游长时间不可用时若每条查询都去探测，
+        /// 每条都要白等一个 `NS_QUERY_TIMEOUT`。
+        ///
+        /// 同时供 `lookup_ip` 使用——它按单个上游并发查询，不经过 `lookup`。
+        pub(crate) fn allow_probe_if_all_cooling(&self) {
+            if self.servers.is_empty() || !self.servers.iter().all(|ns| ns.is_failing()) {
+                return;
+            }
+            if self
+                .servers
+                .iter()
+                .any(|ns| ns.since_last_failure() < NS_PROBE_INTERVAL)
+            {
+                return;
+            }
+            log::debug!(
+                "[ns] all {} nameservers in cooldown, allowing probe",
+                self.servers.len()
+            );
+            for ns in &self.servers {
+                ns.allow_probe();
+            }
+        }
+
         fn options(&self) -> &Arc<ResolverOpts> {
             &self.resolver_opts
         }
@@ -396,26 +543,58 @@ mod name_server_group {
             name: N,
             options: O,
         ) -> Result<DnsResponse, LookupError> {
-            use futures_util::future::select_all;
             let name = name.into_name()?;
-            let mut tasks = self
-                .servers
-                .iter()
-                .map(|ns| GenericResolver::lookup(ns.as_ref(), name.clone(), options.clone()))
-                .collect::<Vec<_>>();
+            let options: LookupOptions = options.into();
 
-            loop {
-                let (res, _idx, rest) = select_all(tasks).await;
+            // 用 detached task 替代 FuturesUnordered 的早期 return，消除僵尸请求。
+            //
+            // 原方案：FuturesUnordered + 首个有效结果 return，会 drop 其余 future。
+            // 被 cancel 的请求在 DnsMultiplexer 的 active_requests 中遗留 request ID，
+            // 直到上游响应到达或超时才释放——这就是"僵尸请求"。慢速上游（5s 超时）
+            // 让僵尸长期占用 32 个槽位，导致新请求触发 Busy 错误（实测 1057 次/h）。
+            //
+            // 新方案：每个服务器查询 spawn 为独立 task，通过 mpsc channel 回传结果。
+            // 首个有效结果返回后，其余 task 在后台自然完成并释放 DnsMultiplexer 槽位，
+            // 不产生僵尸。代价是慢速服务器的查询多占用少量带宽，但 per-NameServer
+            // semaphore 会自然限流，且 task 会在超时后自动结束。
+            // 空上游组直接返回无连接错误：否则 mpsc::channel(0) 在容量为 0 时会 panic，
+            // 且后续 recv() 也将无意义地空等。
+            if self.servers.is_empty() {
+                return Err(crate::libdns::proto::ProtoErrorKind::NoConnections.into());
+            }
 
+            // 熔断半开保护：整组上游同时处于冷却时，冷却判断可能已经过期（网络恢复、
+            // 或此前的一批失败本是同一故障）。全部跳过会让客户端在整个冷却窗口内只拿到
+            // SERVFAIL，因此清空计数让本轮真实发一次探测；探测若再次失败会重新累计。
+            self.allow_probe_if_all_cooling();
+
+            let total = self.servers.len();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(total);
+
+            for ns in &self.servers {
+                let ns = Arc::clone(ns);
+                let name = name.clone();
+                let options = options.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let res = GenericResolver::lookup(ns.as_ref(), name, options).await;
+                    let _ = tx.send(res).await;
+                });
+            }
+            drop(tx);
+
+            let mut received = 0;
+            while let Some(res) = rx.recv().await {
+                received += 1;
                 if matches!(res.as_ref(), Ok(lookup) if !lookup.records().is_empty()) {
                     return res;
                 }
-
-                if rest.is_empty() {
+                if received == total {
                     return res;
                 }
-                tasks = rest;
             }
+
+            Err(crate::libdns::proto::ProtoErrorKind::NoConnections.into())
         }
     }
 }
@@ -430,6 +609,18 @@ mod name_server {
     pub struct NameServer {
         options: Arc<NameServerOpts>,
         connection: Connection,
+        // per-NameServer 并发限制器，防止 DnsMultiplexer 过载
+        semaphore: Arc<Semaphore>,
+        // 熔断状态：连续失败计数 + 最近一次失败时间（用于冷却跳过）
+        fail_streak: AtomicU32,
+        last_failure: Mutex<Option<Instant>>,
+        // 配置快照（用于 WebUI 关联统计与展示）
+        info: NameServerInfo,
+        // 运行期统计（原子计数，只读访问无需加锁）
+        query_count: AtomicU64,
+        success_count: AtomicU64,
+        failure_count: AtomicU64,
+        total_time_ns: AtomicU64,
     }
 
     impl NameServer {
@@ -441,6 +632,7 @@ mod name_server {
             default_client_subnet: Option<ClientSubnet>,
         ) -> anyhow::Result<Self> {
             let url = &config.server;
+            let info = config.clone();
 
             if !url.has_ip() && resolver.is_none() {
                 anyhow::bail!("Parameter resolver is required for non-ip upstream");
@@ -497,7 +689,111 @@ mod name_server {
             Ok(Self {
                 options: options.into(),
                 connection,
+                semaphore: Arc::new(Semaphore::new(PER_NAMESERVER_CONCURRENCY)),
+                fail_streak: AtomicU32::new(0),
+                last_failure: Mutex::new(None),
+                info,
+                query_count: AtomicU64::new(0),
+                success_count: AtomicU64::new(0),
+                failure_count: AtomicU64::new(0),
+                total_time_ns: AtomicU64::new(0),
             })
+        }
+
+        /// 上游是否处于熔断冷却中。连续失败达阈值且距上次失败仍在冷却窗口内返回 true。
+        fn in_cooldown(&self) -> bool {
+            let streak = self.fail_streak.load(Ordering::Relaxed);
+            if streak < NS_FAIL_THRESHOLD {
+                return false;
+            }
+            match *self.last_failure.lock().unwrap_or_else(|e| e.into_inner()) {
+                Some(t) => t.elapsed() < NS_COOLDOWN,
+                None => false,
+            }
+        }
+
+        /// 记录一次成功，清零失败计数。
+        fn record_success(&self) {
+            self.fail_streak.store(0, Ordering::Relaxed);
+        }
+
+        /// 记录一次失败：递增计数并刷新最近失败时间。
+        fn record_failure(&self) {
+            self.fail_streak.fetch_add(1, Ordering::Relaxed);
+            *self.last_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+
+        /// 记录一次成功并累加耗时（ns）。
+        ///
+        /// 仅在查询到达终态时调用：被组内 cancel 的竞速落败请求不会走到这里，
+        /// 因此 query_count 语义为"已完成查询数"（= 成功 + 失败）。
+        fn record_success_time(&self, took: Duration) {
+            self.query_count.fetch_add(1, Ordering::Relaxed);
+            self.success_count.fetch_add(1, Ordering::Relaxed);
+            self.total_time_ns
+                .fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        /// 记录一次失败（含 busy/超时/连接错误）并累加耗时（ns）。
+        fn record_failure_time(&self, took: Duration) {
+            self.query_count.fetch_add(1, Ordering::Relaxed);
+            self.failure_count.fetch_add(1, Ordering::Relaxed);
+            self.total_time_ns
+                .fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        /// 累计查询次数（已建立一次上游查询尝试）。
+        pub fn query_count(&self) -> u64 {
+            self.query_count.load(Ordering::Relaxed)
+        }
+
+        /// 累计成功次数（上游返回非 ServFail/Refused 响应）。
+        pub fn success_count(&self) -> u64 {
+            self.success_count.load(Ordering::Relaxed)
+        }
+
+        /// 累计失败次数（busy/超时/连接错误/ServFail/Refused）。
+        pub fn failure_count(&self) -> u64 {
+            self.failure_count.load(Ordering::Relaxed)
+        }
+
+        /// 平均响应耗时（毫秒）。
+        pub fn avg_time_ms(&self) -> f64 {
+            let q = self.query_count.load(Ordering::Relaxed);
+            if q == 0 {
+                0.0
+            } else {
+                self.total_time_ns.load(Ordering::Relaxed) as f64 / q as f64 / 1_000_000.0
+            }
+        }
+
+        /// 累计耗时（纳秒），用于跨上游聚合。
+        pub fn total_time_ns(&self) -> u64 {
+            self.total_time_ns.load(Ordering::Relaxed)
+        }
+
+        /// 上游是否处于熔断冷却（视为异常/不可用状态）。
+        pub fn is_failing(&self) -> bool {
+            self.in_cooldown()
+        }
+
+        /// 熔断半开：清零连续失败计数，使本上游立即重新参与查询（见 NameServerGroup::lookup）。
+        pub fn allow_probe(&self) {
+            self.fail_streak.store(0, Ordering::Relaxed);
+        }
+
+        /// 距最近一次失败的时长；从未失败时返回 `Duration::MAX`。
+        pub fn since_last_failure(&self) -> Duration {
+            self.last_failure
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::MAX)
+        }
+
+        /// 关联的服务器配置快照。
+        pub fn info(&self) -> &NameServerInfo {
+            &self.info
         }
 
         pub async fn warmup(&self) -> Result<(), ProtoError> {
@@ -526,6 +822,18 @@ mod name_server {
             let options: LookupOptions = options.into();
 
             let query = Query::query(name, options.record_type);
+            // 在 query 被 build_message 移动前捕获名称与类型，供超时日志使用
+            let query_name = query.name().to_utf8();
+            let query_type = query.query_type();
+
+            // 熔断：冷却期内直接跳过该上游，避免对已死/极慢服务器空耗 3s + 占槽 + 刷日志。
+            if self.in_cooldown() {
+                log::debug!("[ns] {} {} in cooldown, skipping", query_name, query_type,);
+                return Err(ProtoErrorKind::NoConnections.into());
+            }
+
+            // 进入实际查询：开始计时（查询/成功/失败计数在终态统一记录）。
+            let start = Instant::now();
 
             let client_subnet = options.client_subnet.or(self.options().client_subnet);
 
@@ -533,7 +841,7 @@ mod name_server {
                 && let Some(subnet) = client_subnet.as_ref()
             {
                 log::debug!(
-                    "query name: {} type: {} subnet: {}/{}",
+                    "[ns] query: {} {} subnet: {}/{}",
                     query.name(),
                     query.query_type(),
                     subnet.addr(),
@@ -554,12 +862,102 @@ mod name_server {
                 request_options,
             );
 
-            let res = {
-                let ns = &self.connection;
-                ns.send(req).first_answer().await?
-            };
+            // per-NameServer 并发限制：防止单个服务器的 DnsMultiplexer 过载。
+            // 每个服务器独立限制并发，避免 NameServerGroup cancel 产生的僵尸请求
+            // 连锁影响其他服务器。
+            let semaphore = self.semaphore.clone();
+            let mut retries = 2u32;
+            let mut backoff_ms = 50u64;
+            let deadline = tokio::time::Instant::now() + NS_LOOKUP_DEADLINE;
 
-            Ok(From::<Message>::from(res.into()))
+            loop {
+                let _permit = semaphore.acquire().await;
+                // 应用层总超时：包裹底层 send，连 TCP/TLS/QUIC 的连接建立阶段也受约束。
+                // 上游不可达时单个查询最多挂 NS_QUERY_TIMEOUT，而不是分钟级。
+                let res = match tokio::time::timeout(NS_QUERY_TIMEOUT, {
+                    let ns = &self.connection;
+                    ns.send(req.clone()).first_answer()
+                })
+                .await
+                {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        log::debug!(
+                            "[ns] lookup timed out after {}ms on {} {}",
+                            NS_QUERY_TIMEOUT.as_millis(),
+                            query_name,
+                            query_type,
+                        );
+                        // 超时错误不可重试：让 NameServerGroup 立即尝试下一个上游，
+                        // 而不是在此上游上空耗 retries 次 × NS_QUERY_TIMEOUT。
+                        Err(ProtoErrorKind::Timeout.into())
+                    }
+                };
+
+                match res {
+                    Ok(response) => {
+                        // SERVFAIL/REFUSED 是有效的 DNS 响应，但仍视为上游失败：
+                        // 记录失败以触发熔断冷却，避免对持续出错的上游反复空耗。
+                        // 响应本身仍回传（无记录），由 NameServerGroup 继续尝试其它上游。
+                        let took = start.elapsed();
+                        match response.response_code() {
+                            ResponseCode::ServFail | ResponseCode::Refused => {
+                                self.record_failure();
+                                self.record_failure_time(took);
+                            }
+                            _ => {
+                                self.record_success();
+                                self.record_success_time(took);
+                            }
+                        }
+                        return Ok(From::<Message>::from(response.into()));
+                    }
+                    // Busy 是上游多路复用器瞬时过载（active_requests 超过上限）。
+                    // 此情形下重试只会加剧拥塞，且 hickory 收到任意发送错误后都会把本上游
+                    // 标记为 Failed 并在下次查询时强制重连（全局 200ms socket 速率限制 +
+                    // TLS 握手），形成“busy → 重连 → 更慢 → 更 busy”的恶性循环。
+                    // 因此 busy 不重试、不占槽等待，立即失败让 NameServerGroup 转向下一个上游。
+                    Err(err) if is_busy(&err) => {
+                        log::debug!(
+                            "[ns] lookup busy (multiplexer overloaded), skipping {} {}",
+                            query_name,
+                            query_type,
+                        );
+                        self.record_failure_time(start.elapsed());
+                        return Err(err.into());
+                    }
+                    Err(err)
+                        if is_retryable(&err)
+                            && retries > 0
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        retries -= 1;
+                        log::debug!(
+                            "[ns] lookup retryable error: {err}, retries left: {}, waiting {}ms",
+                            retries,
+                            backoff_ms,
+                        );
+                        // 持 permit 等待：阻止新请求涌入，让复用器排空或连接重建。
+                        // 不丢 permit，防止其他请求立即填补空位导致 busy 死循环。
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        // 指数退避：50ms → 100ms → 200ms → 400ms → 800ms，最大 1 秒
+                        backoff_ms = (backoff_ms * 2).min(1000);
+                    }
+                    Err(err) => {
+                        // 非重试错误：否定应答算正常回答，其余（超时/SERVFAIL/IO 错误）
+                        // 计入失败并触发熔断冷却。
+                        let took = start.elapsed();
+                        if is_negative_answer(&err) {
+                            self.record_success();
+                            self.record_success_time(took);
+                        } else {
+                            self.record_failure();
+                            self.record_failure_time(took);
+                        }
+                        return Err(err.into());
+                    }
+                }
+            }
         }
     }
 
@@ -710,7 +1108,7 @@ mod bootstrap {
                 Ok(lookup) => {
                     let records = lookup.records().to_vec();
 
-                    debug!(
+                    trace!(
                         "lookup nameserver {} {}, {:?}",
                         name,
                         record_type,
@@ -752,6 +1150,11 @@ mod bootstrap {
     }
 }
 
+// async_trait 宏展开的生成函数会触发 clippy::double_must_use（宏产物误报，非人为标注）。
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait 生成函数触发，宏产物误报"
+)]
 #[async_trait::async_trait]
 pub trait GenericResolver {
     fn options(&self) -> &ResolverOpts;
@@ -773,6 +1176,10 @@ pub trait GenericResolver {
     ) -> Result<DnsResponse, LookupError>;
 }
 
+#[expect(
+    clippy::double_must_use,
+    reason = "async_trait 生成函数触发，宏产物误报"
+)]
 #[async_trait::async_trait]
 pub trait GenericResolverExt {
     /// Performs a dual-stack DNS lookup for the IP for the given hostname.
@@ -861,6 +1268,17 @@ where
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_name_server_group_empty_lookup_no_panic() {
+        use super::GenericResolver;
+        use super::name_server_group::NameServerGroup;
+        // 空上游组必须返回错误，而非在 mpsc::channel(0) 处 panic。
+        let group = NameServerGroup::default();
+        let result = group.lookup("example.com", LookupOptions::default()).await;
+        assert!(result.is_err(), "空上游组 lookup 应返回错误而非 panic");
+    }
+
     use crate::{
         dns_url::DnsUrl,
         preset_ns::{ALIDNS, CLOUDFLARE},
@@ -870,6 +1288,7 @@ mod tests {
     use std::str::FromStr;
 
     #[tokio::test]
+    #[ignore = "requires Internet access; run with --ignored"]
     async fn test_with_default() {
         let client = DnsClient::builder().build().await;
         let lookup_ip = client
@@ -928,6 +1347,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "dns-over-tls")]
+    #[ignore = "requires stable external network connectivity to multiple DNS-over-TLS providers"]
     async fn test_nameserver_tls_resolve() {
         let urls = [
             DnsUrl::from_str("tls://dns.google?enable_sni=false").unwrap(),
@@ -954,6 +1374,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "dns-over-https")]
+    #[ignore = "requires stable external network connectivity to multiple DNS-over-HTTPS providers"]
     async fn test_nameserver_https_resolve() {
         let urls = [
             DnsUrl::from_str("https://dns.cloudflare.com/dns-query").unwrap(),
@@ -978,6 +1399,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "dns-over-h3")]
+    #[ignore = "requires stable external network connectivity (H3/QUIC may be blocked by firewalls)"]
     async fn test_nameserver_h3_resolve() {
         let urls = [DnsUrl::from_str("h3://dns.adguard-dns.com/dns-query").unwrap()];
 
@@ -1022,6 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires stable external network connectivity (Cloudflare/AliDNS may be blocked or unreliable in CI)"]
     async fn test_nameserver_cloudflare_resolve() {
         let dns_urls = CLOUDFLARE
             .ips
@@ -1036,6 +1459,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires stable external network connectivity (Cloudflare/AliDNS may be blocked or unreliable in CI)"]
     async fn test_nameserver_alidns_resolve() {
         let dns_urls = ALIDNS
             .ips
@@ -1050,6 +1474,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "dns-over-quic")]
+    #[ignore = "requires stable external network connectivity (QUIC may be blocked by firewalls)"]
     async fn test_nameserver_quic_resolve() {
         let urls = [
             DnsUrl::from_str("quic://dns.adguard-dns.com").unwrap(),
@@ -1070,6 +1495,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "dns-over-quic")]
+    #[ignore = "requires stable external network connectivity (QUIC may be blocked by firewalls)"]
     async fn test_nameserver_quic_over_proxy_resolve() {
         let urls = [
             DnsUrl::from_str("quic://dns.adguard-dns.com").unwrap(),
@@ -1086,6 +1512,34 @@ mod tests {
             .await;
 
         assert!(results.into_iter().all(|r| r));
+    }
+
+    fn no_records_err(code: ResponseCode) -> ProtoError {
+        use crate::libdns::proto::NoRecords;
+        let query = Query::query(
+            Name::from_ascii("nonexistent.example.com.").unwrap(),
+            RecordType::A,
+        );
+        ProtoError::from(ProtoErrorKind::NoRecordsFound(NoRecords::new(query, code)))
+    }
+
+    #[test]
+    fn test_negative_answer_is_not_an_upstream_failure() {
+        // NXDOMAIN（域名不存在）与 NODATA（该类型无记录）都是上游的正常回答，
+        // 绝不能计入熔断失败计数，否则一批不存在的域名就会打死健康上游。
+        assert!(is_negative_answer(&no_records_err(ResponseCode::NXDomain)));
+        assert!(is_negative_answer(&no_records_err(ResponseCode::NoError)));
+    }
+
+    #[test]
+    fn test_servfail_and_timeout_are_upstream_failures() {
+        // SERVFAIL/REFUSED 说明上游没能完成解析，超时说明链路故障：仍需触发熔断。
+        assert!(!is_negative_answer(&no_records_err(ResponseCode::ServFail)));
+        assert!(!is_negative_answer(&no_records_err(ResponseCode::Refused)));
+        assert!(!is_negative_answer(&ProtoError::from(
+            ProtoErrorKind::Timeout
+        )));
+        assert!(!is_negative_answer(&ProtoError::from(ProtoErrorKind::Busy)));
     }
 
     // #[test]

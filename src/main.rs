@@ -21,10 +21,12 @@ mod dns_mw_audit;
 mod dns_mw_bogus;
 mod dns_mw_cache;
 mod dns_mw_cname;
+mod dns_mw_debug;
 mod dns_mw_dns64;
 mod dns_mw_dnsmasq;
 mod dns_mw_dualstack;
 mod dns_mw_hosts;
+mod dns_mw_ipset;
 #[cfg(all(feature = "nft", target_os = "linux"))]
 mod dns_mw_nftset;
 mod dns_mw_ns;
@@ -42,6 +44,7 @@ mod proxy;
 #[cfg(feature = "resolve-cli")]
 mod resolver;
 mod rustls;
+mod rustls_self_signed;
 mod server;
 #[cfg(feature = "service")]
 mod service;

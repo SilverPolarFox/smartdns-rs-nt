@@ -12,9 +12,12 @@ pub struct DomainRule {
 
     pub cname: Option<CNameRule>,
 
-    pub srv: Option<SRV>,
+    pub srv: Option<Vec<SRV>>,
 
     pub https: Option<HttpsRecordRule>,
+
+    /// Static TXT records; several `txt-record` lines for one domain accumulate.
+    pub txt: Option<Vec<String>>,
 
     /// The mode of speed checking.
     pub speed_check_mode: Option<SpeedCheckModeList>,
@@ -26,6 +29,9 @@ pub struct DomainRule {
     pub no_cache: Option<bool>,
     pub no_serve_expired: Option<bool>,
     pub nftset: Option<Vec<ConfigForIP<NFTsetConfig>>>,
+
+    /// ipset names for this domain
+    pub ipsets: Option<Vec<String>>,
 
     pub rr_ttl: Option<u64>,
     pub rr_ttl_min: Option<u64>,

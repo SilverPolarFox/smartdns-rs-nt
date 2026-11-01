@@ -11,11 +11,13 @@ use hickory_resolver::config::NameServerConfig;
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io, net::SocketAddr, pin::Pin};
+
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
 use crate::libdns::{
     proto::{
@@ -482,7 +484,84 @@ async fn new_connection(
     Ok(conn)
 }
 
-/// The Tokio Runtime for async execution
+/// 全局 socket 创建信号量，限制并发 socket 创建数量，防止 OS 资源耗尽。
+/// Windows 上大量并发创建 socket 会导致 "resource too busy" 错误 (WSAENOBUFS)。
+/// 注意：信号量与速率限制器配合使用。速率限制器（200ms 间隔）是主防线，
+/// 信号量是辅助安全网，防止极端并发场景下的瞬时突发。
+/// 并发数设为 2，确保即使在最坏情况下也不会压垮 OS 缓冲。
+static SOCKET_CREATE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn socket_create_semaphore() -> Arc<Semaphore> {
+    SOCKET_CREATE_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone()
+}
+
+/// 全局 socket 创建速率限制器，确保两次 socket 创建之间有最小间隔。
+/// 这是防止 "resource too busy" 的主防线——通过串行化 socket 创建，
+/// 给 OS 足够时间释放缓冲资源，从根本上避免 WSAENOBUFS。
+/// 信号量（SOCKET_CREATE_SEMAPHORE）作为辅助安全网，防止极端并发下的瞬时突发。
+static SOCKET_RATE_LIMITER: OnceLock<TokioMutex<Instant>> = OnceLock::new();
+
+/// 最近一次出现资源耗尽错误（WSAENOBUFS/ENOBUFS）的时刻（epoch 毫秒）。
+/// 节流只在「最近 60s 真的撞过资源耗尽」时启用；稳态下不再为每次 socket 创建强付 200ms。
+static LAST_RESOURCE_BUSY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 资源耗尽后维持节流的时间窗口。
+const RESOURCE_BUSY_WINDOW: Duration = Duration::from_secs(60);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 记录一次资源耗尽错误，启用随后的 socket 创建节流。
+fn mark_resource_busy() {
+    LAST_RESOURCE_BUSY_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn resource_busy_recently() -> bool {
+    let last = LAST_RESOURCE_BUSY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last != 0 && now_ms().saturating_sub(last) < RESOURCE_BUSY_WINDOW.as_millis() as u64
+}
+
+async fn socket_rate_limit() {
+    socket_rate_limit_with(resource_busy_recently()).await;
+}
+
+/// `busy` 由调用方注入：测试稳态/节流两条路径时不必读写进程级全局状态，
+/// 否则与其它用例并发运行时结果不可复现（资源耗尽标记是全局的）。
+async fn socket_rate_limit_with(busy: bool) {
+    // 稳态不节流：无条件 sleep 会让每条查询固定多付 200ms（上游 1–8ms → 端到端 200ms+）
+    if !busy {
+        return;
+    }
+
+    let mutex = SOCKET_RATE_LIMITER.get_or_init(|| TokioMutex::new(Instant::now()));
+    let mut last = mutex.lock().await;
+    let elapsed = last.elapsed();
+    // 两次 socket 创建之间至少间隔 200ms，给 OS 足够时间释放缓冲资源。
+    // Windows 在大量快速创建 socket 时容易触发 WSAENOBUFS (10055)，
+    // 200ms 间隔经验证可有效避免该错误。
+    let min_interval = Duration::from_millis(200);
+    if elapsed < min_interval {
+        tokio::time::sleep(min_interval - elapsed).await;
+    }
+    *last = Instant::now();
+}
+
+/// 检测是否为 OS 资源耗尽错误 (WSAENOBUFS on Windows, ENOBUFS on Linux)
+/// 同时匹配错误消息文本，防止因错误码包装不一致导致漏检。
+fn is_resource_busy(err: &io::Error) -> bool {
+    // Windows: WSAENOBUFS = 10055
+    // Linux: ENOBUFS = 105
+    err.raw_os_error() == Some(10055)
+        || err.raw_os_error() == Some(105)
+        || err.to_string().contains("resource too busy")
+}
+
 #[derive(Clone, Default)]
 pub struct TokioRuntimeProvider {
     proxy: Option<ProxyConfig>,
@@ -566,27 +645,48 @@ impl crate::libdns::proto::runtime::RuntimeProvider for TokioRuntimeProvider {
 
         let so_mark = self.so_mark;
         let device = self.device.clone();
-        let setup_socket = move |tcp| {
-            setup_socket(&tcp, bind_addr, so_mark, device);
-            tcp
-        };
         let wait_for = timeout.unwrap_or_else(|| Duration::from_secs(5));
 
+        let semaphore = socket_create_semaphore();
+
         Box::pin(async move {
-            async move {
-                proxy::connect_tcp(server_addr, proxy_config.as_ref())
-                    .await
-                    .map(setup_socket)
-                    .map(AsyncIoTokioAsStd)
+            let mut retries = 5u32;
+            let mut backoff_ms = 50u64;
+            loop {
+                socket_rate_limit().await;
+                let _permit = semaphore.acquire().await;
+                let result = async {
+                    let tcp = proxy::connect_tcp(server_addr, proxy_config.as_ref()).await?;
+                    setup_socket(&tcp, bind_addr, so_mark, device.clone());
+                    Ok(AsyncIoTokioAsStd(tcp))
+                }
+                .timeout(wait_for)
+                .await;
+
+                match result {
+                    Ok(Ok(tcp)) => return Ok(tcp),
+                    Ok(Err(err)) if is_resource_busy(&err) && retries > 0 => {
+                        mark_resource_busy();
+                        retries -= 1;
+                        log::debug!(
+                            "[ns] TCP socket creation resource busy, retries left: {}, \
+                             waiting {}ms for OS to release buffer resources",
+                            retries,
+                            backoff_ms,
+                        );
+                        drop(_permit);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(1000);
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_elapsed) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("connection to {server_addr:?} timed out after {wait_for:?}"),
+                        ));
+                    }
+                }
             }
-            .timeout(wait_for)
-            .await
-            .unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("connection to {server_addr:?} timed out after {wait_for:?}"),
-                ))
-            })
         })
     }
 
@@ -599,12 +699,40 @@ impl crate::libdns::proto::runtime::RuntimeProvider for TokioRuntimeProvider {
 
         let so_mark = self.so_mark;
         let device = self.device.clone();
-        let setup_socket = move |udp| setup_socket(udp, None, so_mark, device);
+
+        let semaphore = socket_create_semaphore();
 
         Box::pin(async move {
-            proxy::connect_udp(server_addr, local_addr, proxy_config.as_ref())
-                .await
-                .map(setup_socket)
+            let mut retries = 5u32;
+            let mut backoff_ms = 50u64;
+            loop {
+                // 速率限制：确保 socket 创建之间有最小间隔，给 OS 时间释放缓冲资源
+                socket_rate_limit().await;
+                // 限制并发 socket 创建数量，防止同时创建过多 socket
+                let _permit = semaphore.acquire().await;
+                match proxy::connect_udp(server_addr, local_addr, proxy_config.as_ref())
+                    .await
+                    .map(|udp| setup_socket(udp, None, so_mark, device.clone()))
+                {
+                    Ok(socket) => return Ok(socket),
+                    Err(err) if is_resource_busy(&err) && retries > 0 => {
+                        mark_resource_busy();
+                        retries -= 1;
+                        log::debug!(
+                            "[ns] socket creation resource busy, retries left: {}, \
+                             waiting {}ms for OS to release buffer resources",
+                            retries,
+                            backoff_ms,
+                        );
+                        // 释放信号量，等待 OS 释放缓冲资源后重试
+                        drop(_permit);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        // 指数退避：50ms → 100ms → 200ms → 400ms → 800ms，最大 1 秒
+                        backoff_ms = (backoff_ms * 2).min(1000);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         })
     }
 
@@ -625,8 +753,26 @@ impl QuicSocketBinder for TokioQuicSocketBinder {
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
         use quinn::Runtime;
-        let socket = next_random_udp(local_addr)?;
-        quinn::TokioRuntime.wrap_udp_socket(socket)
+        let mut retries = 5u32;
+        let mut backoff_ms = 50u64;
+        loop {
+            let socket = match next_random_udp(local_addr) {
+                Ok(s) => s,
+                Err(err) if is_resource_busy(&err) && retries > 0 => {
+                    mark_resource_busy();
+                    retries -= 1;
+                    log::debug!(
+                        "[ns] QUIC socket bind resource busy, retries left: {retries}, \
+                         waiting {backoff_ms}ms for OS to release buffer resources",
+                    );
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = (backoff_ms * 2).min(1000);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            return quinn::TokioRuntime.wrap_udp_socket(socket);
+        }
     }
 }
 
@@ -713,6 +859,27 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
     }
 }
 
+/// 同步 socket 创建速率限制器，用于 QUIC/H3 的 bind_quic 路径。
+/// QUIC 路径是同步调用（QuicSocketBinder trait），无法使用 async 信号量，
+/// 因此使用 std Mutex + thread::sleep 实现。最大阻塞 200ms，在启动/重连场景可接受。
+static QUIC_SOCKET_RATE_LIMITER: OnceLock<std::sync::Mutex<Instant>> = OnceLock::new();
+
+fn quic_socket_rate_limit() {
+    if !resource_busy_recently() {
+        return;
+    }
+    let mut last = QUIC_SOCKET_RATE_LIMITER
+        .get_or_init(|| std::sync::Mutex::new(Instant::now()))
+        .lock()
+        .unwrap();
+    let elapsed = last.elapsed();
+    let min_interval = Duration::from_millis(200);
+    if elapsed < min_interval {
+        std::thread::sleep(min_interval - elapsed);
+    }
+    *last = Instant::now();
+}
+
 fn next_random_udp(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     const ATTEMPT_RANDOM: usize = 10;
     if bind_addr.port() == 0 {
@@ -726,9 +893,13 @@ fn next_random_udp(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 
             let bind_addr = SocketAddr::new(bind_addr.ip(), port);
 
+            // 每次 bind 前应用速率限制，防止并发 QUIC/H3 socket 创建耗尽 OS 资源。
+            // Windows 在大量并发 bind 时容易出现 WSAENOBUFS (10055)。
+            quic_socket_rate_limit();
+
             match std::net::UdpSocket::bind(bind_addr) {
                 Ok(socket) => {
-                    log::debug!("created socket successfully");
+                    log::trace!("created socket successfully");
                     return Ok(socket);
                 }
                 Err(err) => {
@@ -737,5 +908,12 @@ fn next_random_udp(bind_addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
             }
         }
     }
+    // 指定端口时也应用速率限制
+    quic_socket_rate_limit();
     std::net::UdpSocket::bind(bind_addr)
 }
+
+// 测试模块已移至 connection_provider_tests.rs
+#[cfg(test)]
+#[path = "connection_provider_tests.rs"]
+mod tests;

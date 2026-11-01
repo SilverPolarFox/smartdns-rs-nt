@@ -21,7 +21,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-latest
+            # 显式用 Intel 池：macos-latest（现指向 macos-26）在 2026-10-30 连续一小时
+            # 分配不到 runner（任务空转 15 分钟后被取消，runner_id=0、steps=0）。
+            # macos-15-intel 与 build.yml 的 x86_64 目标同池，测试直接原生运行。
+            os: macos-15-intel
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: x86_64-unknown-linux-musl
@@ -37,16 +40,20 @@ jobs:
           rust_target: ${{ matrix.target }}
 
       - name: Test
-        run: just test --features=disable_icmp_ping
+        run: just test --features=disable_icmp_ping 2>&1 | tee test.log
         env:
           USE_CROSS: ${{ matrix.os == 'ubuntu-latest' }}
 
-      - name: Setup upterm session for debugging
-        uses: lhotari/action-upterm@v1
-        if: ${{ failure() }}
-        with:
-          limit-access-to-actor: true
-          wait-timeout-minutes: 5
+      # 失败测试名写入 annotation：日志域名在部分网络下不可达，annotation 始终可读
+      - name: Surface failing tests
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f test.log ]; then
+            grep -E '^(test .*FAILED|failures:|---- .* stdout ----|thread .*panicked|error\[E[0-9]+\])' test.log               | head -40 | while IFS= read -r line; do echo "::error title=test-failure::$line"; done
+            echo '--- failure context ---'
+            grep -n -A20 'stdout ----' test.log | head -60
+          fi
 
   cleanliness:
     name: cleanliness ${{ matrix.target }}
@@ -105,12 +112,10 @@ jobs:
           # - target: i686-pc-windows-gnu  # error: linker `i686-w64-mingw32-gcc` not found
           #   os: windows-latest
           #   archive: zip
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: zip
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: zip
+          # macOS 目标不在此重复打包：一次 push 若同时排 test + cleanliness + compatibility
+          # 三个 macOS 任务，runner 抢不到时空转 15 分钟就被取消（runner_id=0、steps=0），
+          # 整个 run 判失败。两个 darwin 目标的编译与打包由 build.yml 在发版时验证，
+          # 这里保留上面的 test x86_64-apple-darwin 覆盖 macOS 运行时行为。
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz tar.xz tar.zst

@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::{Either, select};
-use tokio::time::sleep;
 
 use crate::config::SpeedCheckMode;
 use crate::dns::*;
@@ -12,6 +11,14 @@ use crate::middleware::*;
 use crate::third_ext::FutureTimeoutExt;
 
 pub struct DnsDualStackIpSelectionMiddleware;
+
+/// 两族测速的**整体**预算（不是每族各 200ms）：超预算即视为测不出结果。
+const PING_BUDGET: Duration = Duration::from_millis(200);
+
+/// 等另一族应答的上限。客户端 Happy Eyeballs 通常在 ~250ms 内就切到可用族，
+/// 等到 2s 没有意义；取 500ms：正常 AAAA 都在这之内，超时即按「对方更快」返回空，
+/// 既能兜住异常链路的尾延迟，也不会误杀健康但稍慢的 AAAA。
+const OTHER_FAMILY_WAIT_CAP: Duration = Duration::from_millis(500);
 
 #[async_trait::async_trait]
 impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError>
@@ -66,7 +73,13 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError>
             .domain_rule
             .get_ref(|r| r.speed_check_mode.as_ref())
             .cloned()
+            .or_else(|| ctx.cfg().speed_check_mode().cloned())
             .unwrap_or_default();
+
+        // 没有任何测速模式时无法比较两族延迟，继续并发另一族只是白等
+        if speed_check_mode.is_empty() {
+            return next.run(ctx, req).await;
+        }
 
         let ttl = ctx.cfg().rr_ttl().unwrap_or_default() as u32;
 
@@ -122,8 +135,8 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError>
                 Err(err) => Err(err),
             },
             Either::Right((res, this)) => match res {
-                Ok(that) => match this.await {
-                    Ok(this) => {
+                Ok(that) => match tokio::time::timeout(OTHER_FAMILY_WAIT_CAP, this).await {
+                    Ok(Ok(this)) => {
                         let that_faster = matches!(
                             which_faster(&this, &that, &speed_check_mode, selection_threshold)
                                 .await,
@@ -135,7 +148,10 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError>
                         }
                         Ok(this)
                     }
-                    Err(err) => Err(err),
+                    Ok(Err(err)) => Err(err),
+                    // 对方先到时本族仍未返回：按「对方更快」处理，AAAA 查询返回空，
+                    // 让客户端立刻走 A，而不是被异常链路拖住。
+                    Err(_) => this_no_records(),
                 },
                 Err(_) => this.await,
             },
@@ -152,19 +168,18 @@ async fn which_faster(
     let this_ip_addrs = this.ip_addrs();
     let that_ip_addrs = that.ip_addrs();
 
-    let this_ping = multi_mode_ping_fastest(this_ip_addrs, modes.to_vec()).boxed();
-    let that_ping = multi_mode_ping_fastest(that_ip_addrs, modes.to_vec()).boxed();
+    let deadline = tokio::time::Instant::now() + PING_BUDGET;
+    let this_ping = multi_mode_ping_fastest(this_ip_addrs, modes.to_vec(), deadline).boxed();
+    let that_ping = multi_mode_ping_fastest(that_ip_addrs, modes.to_vec(), deadline).boxed();
 
     let which_faster = select(this_ping, that_ping).await;
 
     let that_faster = match which_faster {
-        Either::Right((Some((_, that_dura)), this_ping)) => match this_ping.await {
-            Some((_, this_dura)) => {
-                this_dura > that_dura && (this_dura - that_dura) > selection_threshold
-            }
-            None => true,
-        },
-        _ => false,
+        Either::Right((that_res, this_ping)) => {
+            let this_dura = this_ping.await.map(|(_, d)| d);
+            decide_that_faster(this_dura, that_res.map(|(_, d)| d), selection_threshold)
+        }
+        Either::Left(_) => false,
     };
 
     if that_faster {
@@ -177,9 +192,9 @@ async fn which_faster(
 async fn multi_mode_ping_fastest(
     ip_addrs: Vec<IpAddr>,
     modes: Vec<SpeedCheckMode>,
+    deadline: tokio::time::Instant,
 ) -> Option<(IpAddr, Duration)> {
     use crate::infra::ping::{PingOptions, ping_fastest};
-    let duration = Duration::from_millis(200);
     let ping_ops = PingOptions::default().with_timeout_secs(2);
 
     let mut fastest_ip = None;
@@ -187,27 +202,86 @@ async fn multi_mode_ping_fastest(
     for mode in &modes {
         let dests = mode.to_ping_addrs(&ip_addrs);
 
+        // 整体预算：所有模式共享同一个 deadline，而不是每种模式各等 200ms
         let ping_task = ping_fastest(dests, ping_ops).boxed();
-        let timeout_task = sleep(duration).boxed();
-        match futures_util::future::select(ping_task, timeout_task).await {
-            futures::future::Either::Left((ping_res, _)) => {
-                match ping_res {
-                    Ok(ping_out) => {
-                        // ping success
-                        let ip = ping_out.dest().ip_addr();
-                        let duration = ping_out.elapsed();
-                        fastest_ip = Some((ip, duration));
-                        break;
-                    }
-                    Err(_) => continue,
-                }
+        match tokio::time::timeout_at(deadline, ping_task).await {
+            Ok(Ok(ping_out)) => {
+                let ip = ping_out.dest().ip_addr();
+                let duration = ping_out.elapsed();
+                fastest_ip = Some((ip, duration));
+                break;
             }
-            futures::future::Either::Right((_, _)) => {
-                // timeout
-                continue;
-            }
+            // 该模式没测出结果，换下一个模式（仍受同一 deadline 约束）
+            Ok(Err(_)) => continue,
+            // 整体预算耗尽
+            Err(_) => break,
         }
     }
 
     fastest_ip
+}
+
+/// 「另一地址族明显更快」的判据：不仅更快，且差值严格超过 `dualstack-ip-selection-threshold`，
+/// 避免延迟抖动导致 A/AAAA 来回切换。
+fn is_that_faster(this_dura: Duration, that_dura: Duration, threshold: Duration) -> bool {
+    this_dura > that_dura && (this_dura - that_dura) > threshold
+}
+
+/// 结合两族的测速结果给出最终判定：对方没测出结果就不切换；本族没结果、对方有则切换。
+fn decide_that_faster(
+    this_dura: Option<Duration>,
+    that_dura: Option<Duration>,
+    threshold: Duration,
+) -> bool {
+    match (this_dura, that_dura) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(this_dura), Some(that_dura)) => is_that_faster(this_dura, that_dura, threshold),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_that_faster, is_that_faster};
+    use std::time::Duration;
+
+    #[test]
+    fn test_is_that_faster() {
+        let ms = Duration::from_millis;
+        assert!(
+            is_that_faster(ms(100), ms(50), ms(20)),
+            "差值超过阈值应判更快"
+        );
+        assert!(
+            !is_that_faster(ms(100), ms(50), ms(50)),
+            "差值等于阈值不切换（严格大于）"
+        );
+        assert!(!is_that_faster(ms(50), ms(100), ms(20)), "本族更快不应切换");
+        assert!(
+            !is_that_faster(ms(60), ms(50), ms(20)),
+            "差值小于阈值不切换"
+        );
+    }
+
+    /// 两族测速结果合并判定：含「对方无结果」「本族无结果」两类边界。
+    #[test]
+    fn test_decide_that_faster() {
+        let ms = Duration::from_millis;
+        assert!(
+            decide_that_faster(Some(ms(100)), Some(ms(50)), ms(20)),
+            "对方更快且超过阈值"
+        );
+        assert!(
+            decide_that_faster(None, Some(ms(50)), ms(20)),
+            "本族无结果、对方有"
+        );
+        assert!(
+            !decide_that_faster(Some(ms(50)), None, ms(20)),
+            "对方无结果不切换"
+        );
+        assert!(
+            !decide_that_faster(None, None, ms(20)),
+            "双方都无结果不切换"
+        );
+    }
 }

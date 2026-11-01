@@ -42,6 +42,24 @@ impl LookupError {
         matches!(self, Self::ResponseCode(resc) if resc.eq(&ResponseCode::NXDomain))
     }
 
+    /// 若错误本身携带 DNS 响应码（如 ACL 拒绝），返回该响应码。
+    #[inline]
+    pub fn response_code(&self) -> Option<ResponseCode> {
+        match self {
+            Self::ResponseCode(code) => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// 错误是否表示「该上游当前不可用」（被熔断跳过），而不是对查询本身的结论。
+    ///
+    /// 这类结果不能当作上游对域名的判断：它既不代表域名不存在，也不能用来
+    /// 判定「两个上游结论一致」而提前结束查询。
+    #[inline]
+    pub fn is_no_connections(&self) -> bool {
+        matches!(self, Self::Proto(err) if matches!(err.kind(), ProtoErrorKind::NoConnections))
+    }
+
     #[inline]
     pub fn is_soa(&self) -> bool {
         if let Self::Proto(err) = self
@@ -85,5 +103,111 @@ impl From<ResponseCode> for LookupError {
 impl From<ProtoErrorKind> for LookupError {
     fn from(value: ProtoErrorKind) -> Self {
         Self::Proto(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::libdns::proto::{
+        op::Query,
+        rr::{Name, RecordType},
+    };
+
+    #[test]
+    fn test_is_nx_domain() {
+        assert!(LookupError::ResponseCode(ResponseCode::NXDomain).is_nx_domain());
+        assert!(!LookupError::ResponseCode(ResponseCode::ServFail).is_nx_domain());
+        assert!(!LookupError::NameExists.is_nx_domain());
+    }
+
+    #[test]
+    fn test_is_soa_true() {
+        let name = Name::from_utf8("example.com").unwrap();
+        let query = Query::query(name, RecordType::A);
+        let err = LookupError::no_records_found(query, 300);
+        assert!(err.is_soa());
+    }
+
+    #[test]
+    fn test_is_soa_false() {
+        let err = LookupError::ResponseCode(ResponseCode::ServFail);
+        assert!(!err.is_soa());
+    }
+
+    #[test]
+    fn test_as_soa() {
+        let name = Name::from_utf8("example.com").unwrap();
+        let query = Query::query(name, RecordType::A);
+        let err = LookupError::no_records_found(query.clone(), 300);
+        let result = err.as_soa(&query);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_as_soa_none() {
+        let name = Name::from_utf8("example.com").unwrap();
+        let query = Query::query(name, RecordType::A);
+        let err = LookupError::ResponseCode(ResponseCode::ServFail);
+        assert!(err.as_soa(&query).is_none());
+    }
+
+    #[test]
+    fn test_no_records_found() {
+        let name = Name::from_utf8("example.com").unwrap();
+        let query = Query::query(name, RecordType::A);
+        let err = LookupError::no_records_found(query, 300);
+        assert!(err.is_soa());
+    }
+
+    #[test]
+    fn test_partial_eq_response_code() {
+        let a = LookupError::ResponseCode(ResponseCode::NXDomain);
+        let b = LookupError::ResponseCode(ResponseCode::NXDomain);
+        let c = LookupError::ResponseCode(ResponseCode::ServFail);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_partial_eq_name_exists() {
+        let a = LookupError::NameExists;
+        let b = LookupError::NameExists;
+        assert_eq!(a, b);
+        assert_ne!(a, LookupError::ResponseCode(ResponseCode::ServFail));
+    }
+
+    #[test]
+    fn test_from_response_code() {
+        let err: LookupError = ResponseCode::NXDomain.into();
+        assert!(err.is_nx_domain());
+    }
+
+    #[test]
+    fn test_from_proto_error_kind() {
+        let kind = ProtoErrorKind::Message("test error");
+        let err: LookupError = kind.into();
+        assert!(matches!(err, LookupError::Proto(_)));
+    }
+
+    #[test]
+    fn test_is_no_connections_only_matches_cooldown_skip() {
+        // 熔断跳过是「上游当前不可用」，不能当作对域名的结论
+        let skipped: LookupError = ProtoErrorKind::NoConnections.into();
+        assert!(skipped.is_no_connections());
+
+        // 超时与真实否定应答都不是这个语义
+        let timeout: LookupError = ProtoErrorKind::Timeout.into();
+        assert!(!timeout.is_no_connections());
+
+        let no_records: LookupError = ProtoErrorKind::NoRecordsFound(NoRecords::new(
+            Query::query(
+                Name::from_ascii("nonexistent.example.com.").unwrap(),
+                RecordType::A,
+            ),
+            ResponseCode::NXDomain,
+        ))
+        .into();
+        assert!(!no_records.is_no_connections());
     }
 }

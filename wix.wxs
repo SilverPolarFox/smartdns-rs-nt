@@ -1,6 +1,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
 	<?define ProductName = "SmartDNS" ?>
+    <?define ServiceName = "smartdns-rs" ?>
 	<?define ProductVersion = "$(env.VERSION)" ?>
 	<?define ProductDescription = "Rule-based DNS server for fast IP resolution, DoT/DoQ/DoH/DoH3 supported" ?>
 	<?define ProductURL = "https://github.com/mokeyish/smartdns-rs" ?>
@@ -68,7 +69,7 @@
 
 			<File Source="$(var.SourceDir)/$(var.BinName)" KeyPath="yes" Vital="yes"/>
 
-			<ServiceInstall Id="ServiceInstaller" Name="$(var.ProductName)" DisplayName="$(var.ProductName)@$(var.ProductVersion)" Description="$(var.ProductName) $(var.ProductDescription)" Arguments="run -c &quot;[CommonAppDataFolder]$(var.ProductName)\smartdns.conf&quot; --ws7642ea814a90496daaa54f2820254f12" Type="ownProcess" Start="auto" Account="LocalSystem" ErrorControl="normal" Vital="yes" />
+			<ServiceInstall Id="ServiceInstaller" Name="$(var.ServiceName)" DisplayName="$(var.ProductName)@$(var.ProductVersion)" Description="$(var.ProductName) $(var.ProductDescription)" Arguments="run -c &quot;[ConfDir]smartdns.conf&quot; --ws7642ea814a90496daaa54f2820254f12" Type="ownProcess" Start="auto" Account="LocalSystem" ErrorControl="normal" Vital="yes" />
 
 			<ServiceControl Id="StartService" Name="$(var.ProductName)" Start="install" Wait="no" />
 			<ServiceControl Id="StopService" Name="$(var.ProductName)" Stop="uninstall" Remove="uninstall" Wait="yes" />

@@ -9,10 +9,18 @@ pub struct DnsZoneMiddleware {
 
 impl DnsZoneMiddleware {
     pub fn new() -> Self {
+        Self::with_local_ptr(true)
+    }
+
+    /// `local-ptr-enable no` 时不再注册本地 PTR provider，PTR 查询继续走上游。
+    pub fn with_local_ptr(local_ptr_enable: bool) -> Self {
+        let mut manager = ZoneManager::new();
+        if local_ptr_enable {
+            manager = manager.with_provider(LocalPtrZoneProvider::new());
+        }
+
         Self {
-            manager: ZoneManager::new()
-                .with_provider(LocalPtrZoneProvider::new())
-                .with_provider(IdentityZoneProvider::new()),
+            manager: manager.with_provider(IdentityZoneProvider::new()),
             rule_provider: RuleZoneProvider::new(),
         }
     }
@@ -87,6 +95,30 @@ mod tests {
         assert_eq!(srv.weight(), 2);
     }
 
+    /// 同一域名的多条 srv-record 必须累积成同一个 SRV RRset（对齐 C 版）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_srv_record_multiple() {
+        let cfg = RuntimeConfig::builder()
+            .with("srv-record /_ldap._tcp/ldap1.example.com,389,1,10")
+            .with("srv-record /_ldap._tcp/ldap2.example.com,389,2,20")
+            .build()
+            .unwrap();
+
+        let mock = DnsMockMiddleware::mock(DnsZoneMiddleware::new()).build(cfg);
+        let records = mock
+            .lookup_rdata("_ldap._tcp", RecordType::SRV)
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 2);
+        let mut targets = records
+            .iter()
+            .map(|r| r.as_srv().unwrap().target().to_string())
+            .collect::<Vec<_>>();
+        targets.sort();
+        assert_eq!(targets, vec!["ldap1.example.com", "ldap2.example.com"]);
+    }
+
     #[test]
     fn test_arpa() {
         let local_net = IpSet::new(vec![
@@ -139,7 +171,7 @@ mod tests {
         let mock = DnsMockMiddleware::mock(DnsZoneMiddleware::new()).build(cfg);
         let response = search_with_query(
             &mock,
-            "server-name",
+            "server-name.",
             RecordType::TXT,
             DNSClass::CH,
             "192.168.1.8:5300".parse().unwrap(),

@@ -32,12 +32,17 @@ pub struct DnsContext {
     pub fastest_speed: Duration,
     pub source: LookupFrom,
     pub no_cache: bool,
+    /// 缓存的服务器组名称，避免重复遍历 domain_rule 树
+    server_group_name: String,
 }
 
 impl DnsContext {
     pub fn new(name: &Name, cfg: Arc<RuntimeConfig>, server_opts: ServerOpts) -> Self {
         let group_name = server_opts.rule_group.as_deref().unwrap_or_default();
         let domain_rule = cfg.find_domain_rule(name, group_name);
+
+        // 预计算 server_group_name，后续调用无开销
+        let server_group_name = Self::resolve_server_group_name(&server_opts, &domain_rule);
 
         let no_cache = domain_rule.get(|n| n.no_cache).unwrap_or_default();
 
@@ -48,6 +53,7 @@ impl DnsContext {
             fastest_speed: Default::default(),
             source: Default::default(),
             no_cache,
+            server_group_name,
         }
     }
 
@@ -61,21 +67,29 @@ impl DnsContext {
         &self.server_opts
     }
 
+    #[inline]
     pub fn server_group_name(&self) -> &str {
-        match self.server_opts().group() {
-            Some(n) => n,
+        &self.server_group_name
+    }
+
+    /// 解析服务器组名称：优先 server_opts 直接指定，否则遍历 domain_rule 树查找
+    fn resolve_server_group_name(
+        server_opts: &ServerOpts,
+        domain_rule: &Option<Arc<DomainRuleTreeNode>>,
+    ) -> String {
+        match server_opts.group() {
+            Some(n) => n.to_string(),
             None => {
-                let mut node = self.domain_rule.as_ref();
+                let mut node = domain_rule.as_ref();
 
                 while let Some(rule) = node {
                     if let Some(name) = rule.nameserver.as_deref() {
-                        return name;
+                        return name.to_string();
                     }
-
                     node = rule.zone();
                 }
 
-                "default"
+                "default".to_string()
             }
         }
     }
@@ -278,6 +292,12 @@ mod request {
             self.protocol
         }
 
+        /// The full request message (for diagnostics such as packet dumps).
+        #[inline]
+        pub fn message(&self) -> &Message {
+            &self.message
+        }
+
         pub fn with_cname(&self, name: Name) -> Self {
             Self {
                 id: self.id,
@@ -405,6 +425,8 @@ mod response {
         message: Message,
         valid_until: Instant,
         name_server_group: Option<String>,
+        /// 标记此响应是否来自缓存命中
+        from_cache: bool,
     }
 
     impl PartialEq for DnsResponse {
@@ -450,6 +472,7 @@ mod response {
                 message,
                 valid_until,
                 name_server_group: None,
+                from_cache: false,
             }
         }
 
@@ -458,6 +481,7 @@ mod response {
                 message: Message::query(),
                 valid_until: Instant::now(),
                 name_server_group: None,
+                from_cache: false,
             }
         }
 
@@ -491,6 +515,16 @@ mod response {
         pub fn with_name_server_group(mut self, group_name: String) -> Self {
             self.name_server_group = Some(group_name);
             self
+        }
+
+        /// 返回此响应是否来自缓存命中
+        pub fn is_from_cache(&self) -> bool {
+            self.from_cache
+        }
+
+        /// 标记此响应来自缓存
+        pub fn mark_from_cache(&mut self) {
+            self.from_cache = true;
         }
 
         pub fn records(&self) -> &[Record] {
@@ -559,6 +593,7 @@ mod response {
                 message,
                 valid_until,
                 name_server_group: None,
+                from_cache: false,
             }
         }
     }

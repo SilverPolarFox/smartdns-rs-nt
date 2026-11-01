@@ -8,7 +8,7 @@ pub fn bind_to<T: LocalAddr>(
     bind_addr: SocketAddr,
     bind_device: Option<&str>,
     bind_type: &str,
-) -> T {
+) -> io::Result<T> {
     let device_note = bind_device
         .map(|device| format!("@{device}"))
         .unwrap_or_default();
@@ -24,15 +24,19 @@ pub fn bind_to<T: LocalAddr>(
                 local_addr,
                 device_note
             );
-            socket
+            Ok(socket)
         }
-        Err(err) => panic!("cound not bind to {bind_type}: {bind_addr}, {err}"),
+        Err(err) => {
+            log::error!("could not bind to {bind_type}: {bind_addr}, {err}");
+            Err(err)
+        }
     }
 }
 
 pub fn setup_tcp_socket(
     bind_addr: SocketAddr,
     bind_device: Option<&str>,
+    buff_size: Option<usize>,
 ) -> io::Result<TcpListener> {
     let socket = Socket::new(
         Domain::for_address(bind_addr),
@@ -40,7 +44,7 @@ pub fn setup_tcp_socket(
         Some(Protocol::TCP),
     )?;
 
-    setup_socket(&socket, bind_device, bind_addr)?;
+    setup_socket(&socket, bind_device, bind_addr, buff_size)?;
 
     socket.listen(128)?;
 
@@ -51,14 +55,18 @@ pub fn setup_tcp_socket(
     Ok(tcp_listener)
 }
 
-pub fn setup_udp_socket(bind_addr: SocketAddr, bind_device: Option<&str>) -> io::Result<UdpSocket> {
+pub fn setup_udp_socket(
+    bind_addr: SocketAddr,
+    bind_device: Option<&str>,
+    buff_size: Option<usize>,
+) -> io::Result<UdpSocket> {
     let socket = Socket::new(
         Domain::for_address(bind_addr),
         Type::DGRAM,
         Some(Protocol::UDP),
     )?;
 
-    setup_socket(&socket, bind_device, bind_addr)?;
+    setup_socket(&socket, bind_device, bind_addr, buff_size)?;
 
     let udp_socket = std::net::UdpSocket::from(socket);
 
@@ -75,6 +83,7 @@ fn setup_socket<'a, T: Into<SockRef<'a>>>(
     socket: T,
     bind_device: Option<&str>,
     bind_addr: SocketAddr,
+    buff_size: Option<usize>,
 ) -> io::Result<()> {
     let sock_ref: SockRef<'a> = socket.into();
     sock_ref.set_nonblocking(true)?;
@@ -88,6 +97,11 @@ fn setup_socket<'a, T: Into<SockRef<'a>>>(
     if sock_typ == Type::STREAM {
         // enable TCP_FASTOPEN
         sock_ref.set_tcp_nodelay(true)?;
+    }
+
+    if let Some(size) = buff_size {
+        sock_ref.set_recv_buffer_size(size)?;
+        sock_ref.set_send_buffer_size(size)?;
     }
 
     sock_ref.set_reuse_address(true)?;
@@ -161,5 +175,39 @@ impl LocalAddr for UdpSocket {
     #[inline]
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.local_addr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 端口 0 让系统分配：UDP/TCP 都应绑定成功，且设置的缓冲区不导致失败。
+    #[tokio::test]
+    async fn test_setup_sockets_ephemeral_port() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let udp = setup_udp_socket(addr, None, Some(256 * 1024)).expect("UDP 应绑定成功");
+        assert_ne!(udp.local_addr().unwrap().port(), 0);
+
+        let tcp = setup_tcp_socket(addr, None, Some(256 * 1024)).expect("TCP 应监听成功");
+        assert_ne!(tcp.local_addr().unwrap().port(), 0);
+    }
+
+    /// 端口被占用时返回 Err，而不是 panic（对齐 R2 的 bind_to 行为）。
+    #[tokio::test]
+    async fn test_bind_conflict_returns_error() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = udp.local_addr().unwrap();
+        assert!(
+            setup_udp_socket(addr, None, None).is_err(),
+            "同一 UDP 端口重复绑定应报错"
+        );
+
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = tcp.local_addr().unwrap();
+        assert!(
+            setup_tcp_socket(addr, None, None).is_err(),
+            "同一 TCP 端口重复监听应报错"
+        );
     }
 }

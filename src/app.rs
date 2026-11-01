@@ -1,14 +1,15 @@
+use std::sync::Mutex as StdMutex;
 use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
+    collections::{HashMap, VecDeque},
+    ops::DerefMut,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{RwLock, Semaphore},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinSet,
 };
 
@@ -18,14 +19,22 @@ use crate::{
     dns_client::DnsClient,
     dns_conf::RuntimeConfig,
     dns_mw::{DnsMiddlewareBuilder, DnsMiddlewareHandler},
+    dns_mw_audit::{QUERY_LOG_MAX, QueryLogEntry},
     dns_mw_cache::DnsCache,
     log,
-    server::{DnsHandle, IncomingDnsRequest, ServerHandle},
+    server::{DnsHandle, IncomingDnsRequest, ServerHandle, refused_response},
     third_ext::FutureJoinAllExt as _,
 };
 
 #[derive(Clone)]
 pub struct App(Arc<AppState>);
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct StatsSnapshot {
+    pub timestamp: u64,
+    pub total_queries: u64,
+    pub cache_hits: u64,
+}
 
 impl App {
     fn new(cfg: Arc<RuntimeConfig>) -> (IncomingDnsRequest, Self) {
@@ -45,6 +54,17 @@ impl App {
                     uptime: Instant::now(),
                     loaded_at: RwLock::const_new(Instant::now()),
                     active_queries: Default::default(),
+                    total_queries: AtomicU64::new(0),
+                    total_query_time_ns: AtomicU64::new(0),
+                    cache_hit_queries: AtomicU64::new(0),
+                    cache_hit_query_time_ns: AtomicU64::new(0),
+                    cache_miss_queries: AtomicU64::new(0),
+                    cache_miss_query_time_ns: AtomicU64::new(0),
+                    bg_total_queries: AtomicU64::new(0),
+                    bg_total_query_time_ns: AtomicU64::new(0),
+                    stats_history: Mutex::const_new(Vec::new()),
+                    dns_client: RwLock::new(None),
+                    query_log: Arc::new(StdMutex::new(VecDeque::with_capacity(QUERY_LOG_MAX))),
                     guard: AppGuard,
                 }
                 .into(),
@@ -58,6 +78,16 @@ impl App {
 
     pub async fn cfg(&self) -> Arc<RuntimeConfig> {
         self.cfg.read().await.clone()
+    }
+
+    /// 运行期上游客户端句柄（用于 WebUI 上游统计）。重载配置后更新。
+    pub async fn dns_client(&self) -> Option<Arc<DnsClient>> {
+        self.dns_client.read().await.clone()
+    }
+
+    /// WebUI 查询日志环形缓冲（内存，非持久化）。
+    pub fn query_log(&self) -> Arc<StdMutex<VecDeque<QueryLogEntry>>> {
+        self.query_log.clone()
     }
 
     pub async fn reload(&self) -> anyhow::Result<()> {
@@ -84,6 +114,83 @@ impl App {
 
     pub fn active_queries(&self) -> usize {
         self.active_queries.load(Ordering::Relaxed)
+    }
+
+    pub fn total_queries(&self) -> u64 {
+        self.total_queries.load(Ordering::Relaxed)
+    }
+
+    pub fn avg_query_time_ms(&self) -> f64 {
+        let total = self.total_queries.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let time_ns = self.total_query_time_ns.load(Ordering::Relaxed);
+        time_ns as f64 / total as f64 / 1_000_000.0
+    }
+
+    /// 缓存命中查询的平均耗时（毫秒）
+    pub fn cache_hit_avg_query_time_ms(&self) -> f64 {
+        let hits = self.cache_hit_queries.load(Ordering::Relaxed);
+        if hits == 0 {
+            return 0.0;
+        }
+        let time_ns = self.cache_hit_query_time_ns.load(Ordering::Relaxed);
+        time_ns as f64 / hits as f64 / 1_000_000.0
+    }
+
+    /// 缓存未命中查询的平均耗时（毫秒），反映真实上游查询性能
+    pub fn cache_miss_avg_query_time_ms(&self) -> f64 {
+        let misses = self.cache_miss_queries.load(Ordering::Relaxed);
+        if misses == 0 {
+            return 0.0;
+        }
+        let time_ns = self.cache_miss_query_time_ns.load(Ordering::Relaxed);
+        time_ns as f64 / misses as f64 / 1_000_000.0
+    }
+
+    /// 缓存命中查询总数
+    pub fn cache_hit_queries(&self) -> u64 {
+        self.cache_hit_queries.load(Ordering::Relaxed)
+    }
+
+    /// 缓存未命中查询总数
+    pub fn cache_miss_queries(&self) -> u64 {
+        self.cache_miss_queries.load(Ordering::Relaxed)
+    }
+
+    pub fn bg_total_queries(&self) -> u64 {
+        self.bg_total_queries.load(Ordering::Relaxed)
+    }
+
+    pub fn bg_avg_query_time_ms(&self) -> f64 {
+        let total = self.bg_total_queries.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let time_ns = self.bg_total_query_time_ns.load(Ordering::Relaxed);
+        time_ns as f64 / total as f64 / 1_000_000.0
+    }
+
+    pub async fn add_stats_snapshot(&self, query_hits: u64) {
+        let mut history = self.stats_history.lock().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let total = self.total_queries();
+        history.push(StatsSnapshot {
+            timestamp: now,
+            total_queries: total,
+            cache_hits: query_hits,
+        });
+        if history.len() > 120 {
+            history.remove(0);
+        }
+    }
+
+    pub async fn stats_history(&self) -> Vec<StatsSnapshot> {
+        self.stats_history.lock().await.clone()
     }
 
     async fn init(&self) {
@@ -171,14 +278,17 @@ impl App {
     async fn update_middleware_handler(&self) {
         let cfg = self.cfg.read().await.clone();
         let mut cache = self.cache.write().await;
+        let dns_client = cfg.create_dns_client().await;
         let middleware_handler = build_middleware(
             &cfg,
             &self.dns_handle,
-            cfg.create_dns_client().await,
+            dns_client.clone(),
             &mut cache,
+            self.query_log.clone(),
         );
 
         *self.mw_handler.write().await = middleware_handler;
+        *self.dns_client.write().await = Some(Arc::new(dns_client));
     }
 }
 
@@ -199,6 +309,19 @@ pub struct AppState {
     uptime: Instant,
     loaded_at: RwLock<Instant>,
     active_queries: AtomicUsize,
+    total_queries: AtomicU64,
+    total_query_time_ns: AtomicU64,
+    cache_hit_queries: AtomicU64,
+    cache_hit_query_time_ns: AtomicU64,
+    cache_miss_queries: AtomicU64,
+    cache_miss_query_time_ns: AtomicU64,
+    bg_total_queries: AtomicU64,
+    bg_total_query_time_ns: AtomicU64,
+    stats_history: Mutex<Vec<StatsSnapshot>>,
+    /// 运行期上游客户端句柄（用于 WebUI 上游统计）。
+    dns_client: RwLock<Option<Arc<DnsClient>>>,
+    /// WebUI 查询日志环形缓冲（内存，非持久化）。
+    query_log: Arc<StdMutex<VecDeque<QueryLogEntry>>>,
     guard: AppGuard,
 }
 
@@ -215,6 +338,8 @@ pub fn serve(cfg: Arc<RuntimeConfig>) {
         cfg.log_num(),
         cfg.log_file_mode().into(),
         cfg.log_config().console(),
+        cfg.log_config().color(),
+        cfg.log_config().syslog(),
     );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -243,13 +368,10 @@ pub fn serve(cfg: Arc<RuntimeConfig>) {
 
             let mut inner_join_set = JoinSet::new();
 
-            let mut last_activity = Instant::now();
-
-            const MAX_IDLE: Duration = Duration::from_secs(30 * 60); // 30 min
-
             const BATCH_SIZE: usize = 256;
 
-            let background_concurrency = Arc::new(Semaphore::new(16));
+            let background_concurrency = Arc::new(Semaphore::new(4));
+            let foreground_concurrency = Arc::new(Semaphore::new(64));
             let mut bg_batch = FuturesUnordered::new();
             let mut requests = Vec::with_capacity(BATCH_SIZE);
 
@@ -260,23 +382,68 @@ pub fn serve(cfg: Arc<RuntimeConfig>) {
                 }
 
                 app.active_queries.fetch_add(count, Ordering::Relaxed);
+                let foreground = requests
+                    .iter()
+                    .filter(|(_, opts, _)| !opts.is_background)
+                    .count();
+                let background = count - foreground;
+                app.total_queries
+                    .fetch_add(foreground as u64, Ordering::Relaxed);
+                app.bg_total_queries
+                    .fetch_add(background as u64, Ordering::Relaxed);
 
                 let handler = app.mw_handler.read().await.clone();
+                let max_query_limit = app.cfg.read().await.max_query_limit();
 
                 let mut batch = FuturesUnordered::new();
 
                 while let Some((message, server_opts, sender)) = requests.pop() {
                     let handler = handler.clone();
+                    let app = app.clone();
+
+                    // 对应 C 版 dns_server.c:483：超过并发上限直接回 REFUSED，不进入处理链
+                    if should_refuse_query(
+                        max_query_limit,
+                        server_opts.is_background,
+                        app.active_queries.load(Ordering::Relaxed),
+                    ) {
+                        warn_query_limit_reached(max_query_limit);
+                        let _ = sender.send(refused_response(message));
+                        // 该请求已计入 active_queries 但不会进入任何批次，手动归还
+                        app.active_queries.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     if server_opts.is_background {
-                        if Instant::now() - last_activity < MAX_IDLE {
-                            bg_batch.push(async move {
-                                let _ = sender.send(process(handler, message, server_opts).await);
-                            });
-                        }
+                        // 背景（预取）请求统一进入 bg_batch，由 background_concurrency(4) 限流。
+                        // 早期实现曾在「空闲 30min」或队列满时丢弃背景请求，导致 sender
+                        // 永久等待、active_queries 计数泄漏；现改为始终处理（让缓存保持新鲜，
+                        // 且空闲期预取开销可忽略）。
+                        bg_batch.push(async move {
+                            let start = Instant::now();
+                            let (result, _from_cache) =
+                                process(handler, message, server_opts).await;
+                            app.bg_total_query_time_ns
+                                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            let _ = sender.send(result);
+                        });
                     } else {
-                        last_activity = Instant::now();
                         batch.push(async move {
-                            let _ = sender.send(process(handler, message, server_opts).await);
+                            let start = Instant::now();
+                            let (result, from_cache) = process(handler, message, server_opts).await;
+                            let elapsed_ns = start.elapsed().as_nanos() as u64;
+                            app.total_query_time_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
+                            if from_cache {
+                                app.cache_hit_queries.fetch_add(1, Ordering::Relaxed);
+                                app.cache_hit_query_time_ns
+                                    .fetch_add(elapsed_ns, Ordering::Relaxed);
+                            } else {
+                                app.cache_miss_queries.fetch_add(1, Ordering::Relaxed);
+                                app.cache_miss_query_time_ns
+                                    .fetch_add(elapsed_ns, Ordering::Relaxed);
+                            }
+                            let _ = sender.send(result);
                         });
                     }
                 }
@@ -294,10 +461,13 @@ pub fn serve(cfg: Arc<RuntimeConfig>) {
                     });
                 }
 
-                if !batch.is_empty() {
+                if !batch.is_empty()
+                    && let Ok(permit) = foreground_concurrency.clone().try_acquire_owned()
+                {
                     inner_join_set.spawn(async move {
                         let count = batch.len();
                         while (batch.next().await).is_some() {}
+                        drop(permit);
                         count
                     });
                 }
@@ -345,7 +515,7 @@ async fn process(
     handler: Arc<DnsMiddlewareHandler>,
     message: SerialMessage,
     server_opts: ServerOpts,
-) -> SerialMessage {
+) -> (SerialMessage, bool) {
     use crate::libdns::proto::ProtoError;
     use crate::libdns::proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
 
@@ -365,53 +535,71 @@ async fn process(
                             response_header.set_recursion_available(true);
                             response_header.set_authoritative(false);
 
-                            let response = {
+                            let (response, from_cache) = {
                                 let start = Instant::now();
+                                let qid = request.id();
+                                let qname = request.query().original().to_string();
+                                let qtype = request.query().query_type();
+                                let bg = server_opts.is_background;
+
+                                // 请求前日志，包含查询 ID 用于串联整个请求链路
+                                log::debug!(
+                                    "[qid={}] {}query: {} {}",
+                                    qid,
+                                    if bg { "[bg] " } else { "" },
+                                    qname,
+                                    qtype,
+                                );
+
                                 let res = handler.search(&request, &server_opts).await;
 
-                                log::debug!(
-                                    "{}Request: {:?}",
-                                    if server_opts.is_background {
-                                        "Background"
-                                    } else {
-                                        ""
-                                    },
-                                    request
-                                );
                                 match res {
                                     Ok(lookup) => {
+                                        let record_count = lookup.record_iter().count();
+                                        let from_cache = lookup.is_from_cache();
                                         log::debug!(
-                                            "Response: {}, Duration: {:?}",
-                                            lookup.deref(),
+                                            "[qid={}] {}done: {} {} -> {} record(s), {:?}",
+                                            qid,
+                                            if bg { "[bg] " } else { "" },
+                                            qname,
+                                            qtype,
+                                            record_count,
                                             start.elapsed()
                                         );
-                                        lookup
+                                        (lookup, from_cache)
                                     }
                                     Err(e) => {
                                         if e.is_nx_domain() {
                                             log::debug!(
-                                                "{}Response: error resolving: NXDomain, Duration: {:?}",
-                                                if server_opts.is_background {
-                                                    "Background"
-                                                } else {
-                                                    ""
-                                                },
+                                                "[qid={}] {}nxdomain: {} {}, {:?}",
+                                                qid,
+                                                if bg { "[bg] " } else { "" },
+                                                qname,
+                                                qtype,
                                                 start.elapsed()
                                             );
                                             response_header
                                                 .set_response_code(ResponseCode::NXDomain);
                                         }
                                         let original = request.query().original();
+                                        let code = e.response_code();
+                                        if let Some(code) = code {
+                                            response_header.set_response_code(code);
+                                        }
                                         match e.as_soa(original) {
-                                            Some(soa) => soa,
+                                            Some(soa) => (soa, false),
+                                            None if code.is_some() => {
+                                                let mut res = DnsResponse::empty();
+                                                res.add_query(original.to_owned());
+                                                (res, false)
+                                            }
                                             None => {
-                                                log::debug!(
-                                                    "{}Response: error resolving: {}, Duration: {:?}",
-                                                    if server_opts.is_background {
-                                                        "Background"
-                                                    } else {
-                                                        ""
-                                                    },
+                                                log::warn!(
+                                                    "[qid={}] {}failed: {} {} -> {}, {:?}",
+                                                    qid,
+                                                    if bg { "[bg] " } else { "" },
+                                                    qname,
+                                                    qtype,
                                                     e,
                                                     start.elapsed()
                                                 );
@@ -419,7 +607,7 @@ async fn process(
                                                     .set_response_code(ResponseCode::ServFail);
                                                 let mut res = DnsResponse::empty();
                                                 res.add_query(original.to_owned());
-                                                res
+                                                (res, false)
                                             }
                                         }
                                     }
@@ -429,22 +617,46 @@ async fn process(
                             let response_message: Message =
                                 response.into_message(Some(response_header));
 
-                            SerialMessage::raw(response_message, addr, protocol)
+                            (
+                                SerialMessage::raw(response_message, addr, protocol),
+                                from_cache,
+                            )
                         }
-                        OpCode::Status => todo!(),
-                        OpCode::Notify => todo!(),
-                        OpCode::Update => todo!(),
-                        OpCode::Unknown(_) => todo!(),
+                        OpCode::Status | OpCode::Notify | OpCode::Update | OpCode::Unknown(_) => {
+                            log::debug!(
+                                "unsupported op code {:?} from {}",
+                                request.op_code(),
+                                addr
+                            );
+                            let mut response_header =
+                                Header::response_from_request(request.header());
+                            response_header.set_response_code(ResponseCode::NotImp);
+                            let mut response_message = Message::query().to_response();
+                            response_message.set_header(response_header);
+                            (SerialMessage::raw(response_message, addr, protocol), false)
+                        }
                     }
                 }
-                MessageType::Response => todo!(),
+                MessageType::Response => {
+                    log::debug!("unexpected response message as query from {}", addr);
+                    let mut response_header = Header::response_from_request(request.header());
+                    response_header.set_response_code(ResponseCode::Refused);
+                    let mut response_message = Message::query().to_response();
+                    response_message.set_header(response_header);
+                    (SerialMessage::raw(response_message, addr, protocol), false)
+                }
             }
         }
         Err(ProtoError { kind, .. }) if kind.as_form_error().is_some() => {
             // We failed to parse the request due to some issue in the message, but the header is available, so we can respond
-            let (request_header, error) = kind
-                .into_form_error()
-                .expect("as form_error already confirmed this is a FormError");
+            let (request_header, error) = match kind.into_form_error() {
+                Ok(form_error) => form_error,
+                // 匹配守卫已确认存在，正常不会到达；保守返回空响应而非 panic。
+                Err(_) => {
+                    log::debug!("form_error vanished after guard; dropping malformed request");
+                    return (SerialMessage::raw(Message::query(), addr, protocol), false);
+                }
+            };
 
             // debug for more info on why the message parsing failed
             log::debug!(
@@ -462,9 +674,37 @@ async fn process(
             response_header.set_response_code(ResponseCode::FormErr);
             let mut response_message = Message::query().to_response();
             response_message.set_header(response_header);
-            SerialMessage::raw(response_message, addr, protocol)
+            (SerialMessage::raw(response_message, addr, protocol), false)
         }
-        _ => SerialMessage::raw(Message::query(), addr, protocol),
+        _ => (SerialMessage::raw(Message::query(), addr, protocol), false),
+    }
+}
+
+/// 并发超限判定（对应 C 版 `dns_server.c:483`）：
+/// `max-query-limit` 为 0 表示不限；超过上限（严格大于）且不是后台预取时才拒绝。
+fn should_refuse_query(max_query_limit: usize, is_background: bool, active_queries: usize) -> bool {
+    max_query_limit > 0 && !is_background && active_queries > max_query_limit
+}
+
+/// 并发超限告警按 120s 节流，避免高负载时刷屏（对齐 C 版行为）。
+fn warn_query_limit_reached(max_query_limit: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let last = LAST_WARN_SECS.load(AtomicOrdering::Relaxed);
+
+    if now.saturating_sub(last) >= 120
+        && LAST_WARN_SECS
+            .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .is_ok()
+    {
+        log::warn!("maximum number of dns queries reached, max: {max_query_limit}");
     }
 }
 
@@ -473,12 +713,14 @@ fn build_middleware(
     dns_handle: &DnsHandle,
     dns_client: DnsClient,
     dns_cache: &mut Option<Arc<DnsCache>>,
+    query_log: Arc<StdMutex<VecDeque<QueryLogEntry>>>,
 ) -> Arc<DnsMiddlewareHandler> {
     use crate::dns_mw_addr::AddressMiddleware;
     use crate::dns_mw_audit::DnsAuditMiddleware;
     use crate::dns_mw_bogus::DnsBogusMiddleware;
     use crate::dns_mw_cache::DnsCacheMiddleware;
-    use crate::dns_mw_cname::DnsCNameMiddleware;
+    use crate::dns_mw_cname::{DnsCNameMiddleware, DnsForceNoCnameMiddleware};
+    use crate::dns_mw_debug::DnsFailPacketMiddleware;
     use crate::dns_mw_dns64::Dns64Middleware;
     use crate::dns_mw_dnsmasq::DnsmasqMiddleware;
     use crate::dns_mw_dualstack::DnsDualStackIpSelectionMiddleware;
@@ -489,15 +731,34 @@ fn build_middleware(
     let middleware_handler = {
         let mut builder = DnsMiddlewareBuilder::new();
 
-        // check if audit enabled.
-        if cfg.audit_enable() && cfg.audit_file().is_some() {
-            builder = builder.with(DnsAuditMiddleware::new(
-                cfg.audit_file().unwrap(),
-                cfg.audit_size(),
-                cfg.audit_num(),
-                cfg.audit_file_mode().into(),
-            ));
+        // 最外层：force-no-CNAME 必须在整条链返回后再裁剪应答
+        if cfg.force_no_cname() {
+            builder = builder.with(DnsForceNoCnameMiddleware);
         }
+
+        // 最外层：失败请求落盘，覆盖整条链路的失败
+        if cfg.debug_save_fail_packet() {
+            builder = builder.with(DnsFailPacketMiddleware);
+        }
+
+        // 审计中间件：始终注册以填充 WebUI 查询日志环形缓冲；仅在启用审计文件时写入磁盘。
+        let audit_file = if cfg.audit_enable() {
+            cfg.audit_file().map(|p| p.to_path_buf())
+        } else {
+            None
+        };
+        let audit_syslog = cfg.audit_enable() && cfg.audit_syslog();
+
+        let audit_options = crate::dns_mw_audit::AuditOptions {
+            file: audit_file,
+            size: cfg.audit_size(),
+            num: cfg.audit_num(),
+            mode: Some(cfg.audit_file_mode()),
+            soa: cfg.audit_soa(),
+            console: cfg.audit_console(),
+            syslog: audit_syslog,
+        };
+        builder = builder.with(DnsAuditMiddleware::new(query_log.clone(), audit_options));
 
         if cfg.rule_groups().values().any(|x| !x.cnames.is_empty()) {
             builder = builder.with(DnsCNameMiddleware);
@@ -509,18 +770,25 @@ fn build_middleware(
 
         builder = builder.with(AddressMiddleware);
 
-        if cfg
-            .dnsmasq_lease_file()
-            .map(|x| x.is_file())
-            .unwrap_or_default()
-        {
-            builder = builder.with(DnsmasqMiddleware::new(
-                cfg.dnsmasq_lease_file().unwrap(),
-                cfg.domain().cloned(),
-            ));
+        let dnsmasq_lease = cfg.dnsmasq_lease_file().filter(|path| path.is_file());
+        let odhcpd_lease = cfg.odhcpd_lease_file().filter(|path| path.is_file());
+        match (dnsmasq_lease, odhcpd_lease) {
+            (Some(dnsmasq), Some(odhcpd)) => {
+                builder = builder.with(
+                    DnsmasqMiddleware::new(dnsmasq, cfg.domain().cloned()).with_odhcpd_file(odhcpd),
+                );
+            }
+            (Some(dnsmasq), None) => {
+                builder = builder.with(DnsmasqMiddleware::new(dnsmasq, cfg.domain().cloned()));
+            }
+            (None, Some(odhcpd)) => {
+                builder =
+                    builder.with(DnsmasqMiddleware::new_odhcpd(odhcpd, cfg.domain().cloned()));
+            }
+            (None, None) => {}
         }
 
-        builder = builder.with(DnsZoneMiddleware::new());
+        builder = builder.with(DnsZoneMiddleware::with_local_ptr(cfg.local_ptr_enable()));
 
         if cfg.resolv_hostanme() {
             builder = builder.with(DnsHostsMiddleware::new());
@@ -531,6 +799,15 @@ fn build_middleware(
         {
             use crate::dns_mw_nftset::DnsNftsetMiddleware;
             builder = builder.with(DnsNftsetMiddleware);
+        }
+
+        // ipset（Linux 通过 ipset CLI 下发）
+        #[cfg(target_os = "linux")]
+        if cfg.ipset_no_speed().is_some()
+            || cfg.rule_groups().values().any(|g| !g.ipsets.is_empty())
+        {
+            use crate::dns_mw_ipset::DnsIpsetMiddleware;
+            builder = builder.with(DnsIpsetMiddleware);
         }
 
         // check if cache enabled.
@@ -552,4 +829,22 @@ fn build_middleware(
     };
 
     Arc::new(middleware_handler)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_refuse_query;
+
+    /// `max-query-limit` 语义（对齐 C `dns_server.c:483`）：0 不限、等于上限放行、严格超过才拒绝、
+    /// 后台预取豁免。
+    #[test]
+    fn test_should_refuse_query() {
+        assert!(!should_refuse_query(0, false, usize::MAX), "0 表示不限");
+        assert!(!should_refuse_query(10, false, 10), "等于上限仍放行");
+        assert!(should_refuse_query(10, false, 11), "严格超过才拒绝");
+        assert!(
+            !should_refuse_query(10, true, 100),
+            "后台预取不受并发上限约束"
+        );
+    }
 }

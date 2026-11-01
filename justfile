@@ -103,7 +103,7 @@ package: patch package-clean package-prepare && zip wix package-list
 [private]
 package-prepare:
   @mkdir -p {{dist_dir}}/{{dist_name}}
-  cp LICENSE README*.md etc/smartdns/smartdns.conf  {{dist_dir}}/{{dist_name}}
+  cp LICENSE README*.md etc/smartdns/smartdns.conf etc/smartdns/example.conf  {{dist_dir}}/{{dist_name}}
   echo "Version: {{version}}" >  {{dist_dir}}/{{dist_name}}/version
   echo "Build date: $(date)" >>  {{dist_dir}}/{{dist_name}}/version
   echo "Branch: $(git rev-parse --abbrev-ref HEAD)" >>  {{dist_dir}}/{{dist_name}}/version
@@ -174,7 +174,7 @@ fmt: patch
 
 # Check the clippy and format.
 cleanliness: patch
-  cargo clippy
+  cargo clippy -- -D warnings
   cargo fmt --all -- --check
 
 

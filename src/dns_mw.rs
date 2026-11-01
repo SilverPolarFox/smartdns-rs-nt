@@ -17,6 +17,21 @@ use crate::{
 
 pub type DnsMiddlewareHost = MiddlewareHost<DnsContext, DnsRequest, DnsResponse, DnsError>;
 
+/// 把客户端 EDNS Client Subnet 规范化成 `IpNet`。
+///
+/// hickory 的 `EcsOption` 解析不做前缀校验（`source_prefix` 只是裸 `u8`），
+/// 因此对方可以给出 > 32（v4）/ > 128（v6）的非法值；这里返回 `None`，
+/// 等价于「没带 ECS」，让调用方回落到客户端源 IP，而不是让请求任务 panic。
+fn ipnet_from_subnet(addr: IpAddr, source_prefix: u8) -> Option<IpNet> {
+    match addr {
+        IpAddr::V4(addr) => Ipv4Net::new(addr, source_prefix).ok().map(IpNet::V4),
+        IpAddr::V6(addr) => match addr.to_ipv4_mapped() {
+            Some(addr) => Ipv4Net::new(addr, source_prefix).ok().map(IpNet::V4),
+            None => Ipv6Net::new(addr, source_prefix).ok().map(IpNet::V6),
+        },
+    }
+}
+
 pub struct DnsMiddlewareHandler {
     cfg: Arc<RuntimeConfig>,
     host: DnsMiddlewareHost,
@@ -40,15 +55,7 @@ impl DnsMiddlewareHandler {
                 EdnsOption::Subnet(s) => Some(s),
                 _ => None,
             })
-            .map(|s| match s.addr() {
-                std::net::IpAddr::V4(addr) => {
-                    IpNet::V4(Ipv4Net::new(addr, s.source_prefix()).unwrap())
-                }
-                std::net::IpAddr::V6(addr) => match addr.to_ipv4_mapped() {
-                    Some(addr) => IpNet::V4(Ipv4Net::new(addr, s.source_prefix()).unwrap()),
-                    None => IpNet::V6(Ipv6Net::new(addr, s.source_prefix()).unwrap()),
-                },
-            });
+            .and_then(|s| ipnet_from_subnet(s.addr(), s.source_prefix()));
 
         let client_rules = cfg.client_rules();
         let rule_group_name = match client_subnet {
@@ -74,7 +81,13 @@ impl DnsMiddlewareHandler {
 
         server_opts.rule_group = rule_group_name.map(|s| s.to_string());
 
-        let mut ctx = DnsContext::new(req.query().name().borrow(), cfg, server_opts.clone());
+        // acl-enable：未匹配任何 client-rules 的客户端直接 REFUSED。
+        // 后台预取由内部发起、没有真实客户端地址，豁免。
+        if cfg.acl_enable() && server_opts.rule_group.is_none() && !server_opts.is_background {
+            return Err(crate::libdns::proto::op::ResponseCode::Refused.into());
+        }
+
+        let mut ctx = DnsContext::new(req.query().name().borrow(), cfg, server_opts);
         self.host.execute(&mut ctx, req).await
     }
 
@@ -148,6 +161,43 @@ mod tests {
 
     use super::*;
     use crate::infra::middleware::*;
+
+    /// acl-enable：未匹配 client-rules 的客户端应被 REFUSED，匹配的客户端与后台预取不受影响。
+    #[tokio::test]
+    async fn test_acl_refuses_unmatched_client() {
+        use crate::dns_conf::RuntimeConfig;
+        use crate::libdns::Protocol;
+        use crate::libdns::proto::op::{Message, ResponseCode};
+        use std::net::SocketAddr;
+
+        let cfg = std::sync::Arc::new(
+            RuntimeConfig::builder()
+                .with("acl-enable yes")
+                .with("client-rules 192.168.1.0/24 -group office")
+                .build()
+                .unwrap(),
+        );
+        let handler = DnsMiddlewareBuilder::new().build(cfg);
+
+        let make_req = |src: &str| {
+            let mut message = Message::query();
+            message.add_query(Query::query("example.com".parse().unwrap(), RecordType::A));
+            DnsRequest::new(message, src.parse::<SocketAddr>().unwrap(), Protocol::Udp)
+        };
+
+        let err = handler
+            .search(&make_req("10.0.0.1:5353"), &Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.response_code(), Some(ResponseCode::Refused));
+
+        if let Err(err) = handler
+            .search(&make_req("192.168.1.5:5353"), &Default::default())
+            .await
+        {
+            assert_ne!(err.response_code(), Some(ResponseCode::Refused));
+        }
+    }
 
     pub struct DnsMockMiddleware {
         map: HashMap<Query, Result<DnsResponse, DnsError>>,
@@ -254,7 +304,6 @@ mod tests {
                 Ok(name) => name,
                 Err(err) => panic!("invalid Name {err}"),
             };
-
             let query = Query::query(name, record_type);
 
             self.map.insert(
@@ -262,6 +311,25 @@ mod tests {
                 Ok(DnsResponse::new_with_max_ttl(query, records)),
             );
 
+            self
+        }
+
+        /// 插入一条带 from_cache 标记的响应，用于模拟缓存命中场景
+        pub fn with_a_record_from_cache<N: IntoName>(
+            mut self,
+            name: N,
+            ip: Ipv4Addr,
+            ttl: u32,
+        ) -> Self {
+            let name = match name.into_name() {
+                Ok(name) => name,
+                Err(err) => panic!("invalid Name {err}"),
+            };
+            let query = Query::query(name, RecordType::A);
+            let record = Record::from_rdata(query.name().clone(), ttl, RData::A(ip.into()));
+            let mut res = DnsResponse::new_with_max_ttl(query.clone(), vec![record]);
+            res.mark_from_cache();
+            self.map.insert(query, Ok(res));
             self
         }
     }
@@ -302,5 +370,114 @@ mod tests {
         let err = res.unwrap_err();
 
         assert!(err.is_soa());
+    }
+
+    /// 链路集成：cname 规则把查询改写到 target 后，内层 address 规则命中并覆盖上游地址，
+    /// 应答最前面插回 CNAME 记录。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cname_rule_then_address_rule_chain() {
+        use crate::dns_mw_addr::AddressMiddleware;
+        use crate::dns_mw_cname::DnsCNameMiddleware;
+
+        let cfg = RuntimeConfig::builder()
+            .with("cname /www.example.com/target.example.com")
+            .with("address /target.example.com/192.0.2.9")
+            .build()
+            .unwrap();
+
+        let mock = DnsMockMiddleware::mock(DnsCNameMiddleware)
+            .with_extra_middleware(AddressMiddleware)
+            .with_a_record("target.example.com.", "198.51.100.7".parse().unwrap())
+            .build(cfg);
+
+        let res = mock.lookup("www.example.com", RecordType::A).await.unwrap();
+
+        let cname = res
+            .answers()
+            .iter()
+            .find(|r| r.record_type() == RecordType::CNAME)
+            .expect("答案里应有 CNAME");
+        assert_eq!(
+            cname.data().as_cname().unwrap().0.to_utf8(),
+            "target.example.com."
+        );
+
+        let a = res
+            .answers()
+            .iter()
+            .find(|r| r.record_type() == RecordType::A)
+            .expect("答案里应有 A");
+        assert_eq!(
+            a.data().as_a().unwrap().0,
+            "192.0.2.9".parse::<Ipv4Addr>().unwrap(),
+            "address 规则应覆盖上游返回的 198.51.100.7"
+        );
+    }
+
+    /// bogus-nxdomain：命中黑名单的地址整条应答转为 NXDOMAIN，未命中的照常返回。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bogus_nxdomain_filters_mocked_ip() {
+        use crate::dns_mw_bogus::DnsBogusMiddleware;
+        use crate::libdns::proto::op::ResponseCode;
+
+        let cfg = std::sync::Arc::new(
+            RuntimeConfig::builder()
+                .with("bogus-nxdomain 203.0.113.7")
+                .build()
+                .unwrap(),
+        );
+
+        let mock = DnsMockMiddleware::mock(DnsBogusMiddleware)
+            .with_a_record("bogus.example.com", "203.0.113.7".parse().unwrap())
+            .build(cfg.clone());
+
+        let err = mock
+            .lookup("bogus.example.com", RecordType::A)
+            .await
+            .unwrap_err();
+        assert_eq!(err.response_code(), Some(ResponseCode::NXDomain));
+
+        let mock = DnsMockMiddleware::mock(DnsBogusMiddleware)
+            .with_a_record("ok.example.com", "198.51.100.7".parse().unwrap())
+            .build(cfg);
+
+        let res = mock.lookup("ok.example.com", RecordType::A).await.unwrap();
+        assert_eq!(res.answers().len(), 1);
+    }
+
+    /// 合法前缀：v4/v6 都按给定前缀截断成网段。
+    #[test]
+    fn test_ipnet_from_subnet_valid() {
+        // ipnet 的 new() 不截断主机位，这里按网络地址比较
+        assert_eq!(
+            ipnet_from_subnet("1.2.3.4".parse().unwrap(), 24).map(|n| n.trunc()),
+            Some(IpNet::V4(
+                Ipv4Net::new("1.2.3.0".parse().unwrap(), 24).unwrap()
+            ))
+        );
+        assert_eq!(
+            ipnet_from_subnet("2001:db8::1".parse().unwrap(), 64).map(|n| n.trunc()),
+            Some(IpNet::V6(
+                Ipv6Net::new("2001:db8::".parse().unwrap(), 64).unwrap()
+            ))
+        );
+    }
+
+    /// 非法前缀（hickory 不校验，客户端可伪造）必须安静地丢弃，而不是 panic。
+    #[test]
+    fn test_ipnet_from_subnet_rejects_oversized_prefix() {
+        assert_eq!(ipnet_from_subnet("1.2.3.4".parse().unwrap(), 33), None);
+        assert_eq!(ipnet_from_subnet("2001:db8::1".parse().unwrap(), 129), None);
+    }
+
+    /// IPv4-mapped IPv6 地址按 v4 处理，与后续 client-rules 匹配保持一致。
+    #[test]
+    fn test_ipnet_from_subnet_mapped_v6() {
+        assert_eq!(
+            ipnet_from_subnet("::ffff:1.2.3.4".parse().unwrap(), 24).map(|n| n.trunc()),
+            Some(IpNet::V4(
+                Ipv4Net::new("1.2.3.0".parse().unwrap(), 24).unwrap()
+            ))
+        );
     }
 }

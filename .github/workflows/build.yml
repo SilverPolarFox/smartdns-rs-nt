@@ -19,53 +19,79 @@ on:
 
   workflow_dispatch:
     inputs:
+      version:
+        type: string
+        required: false
+        description: Version (git tag) to build and release, e.g. v0.13.2. Leave empty to use the branch ref name.
       features:
         type: string
         required: false
         default: default
         description: Space or comma separated list of features to activate
+      prerelease:
+        type: boolean
+        description: "Identify the release as a prerelease. Defaults to false"
+        required: false
 
+# workflow 级 permissions 定义该 workflow 允许的最大权限边界。
+# 作为 reusable workflow 被调用时，调用方传入的 permissions 必须是此处的子集，
+# 否则 GitHub Actions 报 startup_failure。故需同时声明 release job 的 contents:write
+# 与 build-docker job 的 packages:write。
+permissions:
+  contents: write
+  packages: write
 
 jobs:
+  # 矩阵 job 只负责编译、打包并上传 artifact，发布统一交给 release job。
+  # ⚠️ 禁止在这里直接调用 softprops/action-gh-release：多个 job 并发写同一个 tag 的
+  # release 会互相丢弃资产，v0.13.3 的 x86_64-pc-windows-msvc 包就是这样丢的
+  # （当时 job 全绿、artifact 完整，只有 release 上缺资产）。
   build:
     name: build ${{ matrix.target }} ${{ inputs.version }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ---------------- Windows ----------------
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
-          # - target: x86_64-pc-windows-gnu
-          #   os: windows-latest
-          #   archive: zip
-          - target: aarch64-pc-windows-msvc
             os: windows-latest
             archive: zip
           - target: i686-pc-windows-msvc
             os: windows-latest
             archive: zip
-          # - target: i686-pc-windows-gnu  # error: linker `i686-w64-mingw32-gcc` not found
-          #   os: windows-latest
-          #   archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          # 不做 windows-gnu 目标：runner 上缺 MinGW linker（x86_64 需额外装、i686 直接找不到
+          # `i686-w64-mingw32-gcc`），且 wix.wxs 的 Package/Component 写死，GNU 安装包会与
+          # MSVC 版共用同一 UpgradeCode 而互相覆盖安装。
+          # ---------------- macOS ----------------
+          # 显式指定标签，不用 macos-latest：2026-10-30 macos-latest（已指向 macos-26）连续
+          # 一小时分配不到 runner，任务空转 15 分钟后被取消（runner_id=0、steps=0），
+          # v0.13.9 的 release job 因此被跳过；同一时段 Apple Silicon 池（macos-14）也拿不到，
+          # 只有 Intel 池能正常起任务。两个 darwin 目标统一在 macos-15-intel 上构建，
+          # aarch64 由 rustup target 交叉编译（同一 SDK，无需额外工具链）。
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             archive: zip
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
             archive: zip
+          # ---------------- Linux (glibc) ----------------
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz tar.xz tar.zst
           - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz tar.xz tar.zst
+          # ---------------- Linux (musl，静态链接，路由器/OpenWrt 友好) ----------------
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz tar.xz tar.zst
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz tar.xz tar.zst
-          # - target: arch64-unknown-linux-musl
-          #   archive: tar.gz tar.xz tar.zst
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz tar.xz tar.zst
-          - target: x86_64-unknown-linux-gnu
+          - target: i686-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz tar.xz tar.zst
           - target: arm-unknown-linux-musleabi
@@ -74,18 +100,25 @@ jobs:
           - target: arm-unknown-linux-musleabihf
             os: ubuntu-latest
             archive: tar.gz tar.xz tar.zst
-          # - target: mips-unknown-linux-musl
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            archive: tar.gz tar.xz tar.zst
+          # ---------------- Android ----------------
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            archive: tar.gz tar.xz tar.zst
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+            archive: tar.gz tar.xz tar.zst
+          # x86_64-linux-android / riscv64gc-unknown-linux-musl / x86_64-unknown-freebsd
+          # 曾以 optional 加入，构建连续失败后已移除：交叉工具链未验证通过前不进 release 矩阵。
+          # - target: arch64-unknown-linux-musl
           #   archive: tar.gz tar.xz tar.zst
           # - target: mips-unknown-linux-musl
           #   archive: tar.gz tar.xz tar.zst
           # - target: mips64-unknown-linux-muslabi64
           #   archive: tar.gz tar.xz tar.zst
-          - target: aarch64-linux-android
-            os: ubuntu-latest
-            archive: tar.gz tar.xz tar.zst
-          # - target: x86_64-unknown-freebsd
-          #   os: ubuntu-latest
-          #   archive: tar.gz tar.xz tar.zst
+          # ---------------- 其它（未启用，交叉工具链尚未验证） ----------------
           # - target: x86_64-unknown-netbsd
           #   os: ubuntu-latest
           #   archive: tar.gz tar.xz tar.zst
@@ -93,8 +126,9 @@ jobs:
           #   archive: tar.gz tar.xz tar.zst
 
     runs-on: ${{matrix.os}}
-    env:
-      DIST_DIR: smartdns-${{ matrix.target }}
+    # 目前矩阵内目标全部稳定通过，没有条目使用 optional；保留该开关是为了以后新增未验证目标时
+    # 先以 optional 试跑，失败不阻塞 release job（x86_64-pc-windows-gnu 就是这么被隔离的）。
+    continue-on-error: ${{ matrix.optional == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -131,27 +165,117 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*.msi
-            dist/*.exe
             dist/*sha256sum.txt
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2.3.2
-        if: ${{ startsWith(inputs.version, 'v') }}
+  # 单点聚合发布：所有目标构建完成后，一次性下载全部 artifact 并发布到同一个 release。
+  # 同时汇总所有资产的 SHA-256，避免用户逐包校验。
+  release:
+    name: release ${{ inputs.version }}
+    if: ${{ startsWith(inputs.version, 'v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    # job 级 permissions 会覆盖 workflow 级，发布 release 需要 contents:write
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.version }}
+
+      - name: Compute release label
+        id: release_label
+        uses: ./.github/actions/sanitize-label
+        with:
+          raw_label: ${{ inputs.version }}
+          fallback_sha: ${{ github.sha }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: smartdns-*-${{ steps.release_label.outputs.value }}
+          path: dist
+          merge-multiple: true
+
+      - name: Summarize assets and release notes
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          cd dist
+          mapfile -t packages < <(
+            find . -maxdepth 1 -type f \
+              \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.msi' \) \
+              -printf '%f\n' | sort
+          )
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::dist/ 下没有任何发布产物，release 中止"
+            exit 1
+          fi
+          sha256sum "${packages[@]}" > "SHA256SUMS-${VERSION}.txt"
+          cd ..
+
+          {
+            echo '## 平台资产'
+            echo
+            for file in "${packages[@]}"; do
+              echo "- \`$file\`"
+            done
+            echo "- \`SHA256SUMS-${VERSION}.txt\`：以上全部文件的 SHA-256 校验和"
+          } > release-body.md
+
+          # 取 CHANGELOG 中本版本段落作为变更说明；取不到就不覆盖 release 原有说明
+          awk -v tag="$VERSION" '
+            index($0, "## [" tag "]") == 1 { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-changelog.md
+
+          if [ -s release-changelog.md ]; then
+            {
+              echo
+              echo '## 变更'
+              echo
+              cat release-changelog.md
+            } >> release-body.md
+            echo "bodyPath=$GITHUB_WORKSPACE/release-body.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::CHANGELOG.md 中没有 ${VERSION} 段落，保留 release 原有说明"
+            echo "bodyPath=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
           draft: false
           prerelease: ${{ inputs.prerelease }}
-          tag_name: ${{ inputs.version }}
+          # 预发布版不能标记为 latest，否则 GitHub API 报错
+          make_latest: ${{ inputs.prerelease == false && 'true' || 'false' }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body_path: ${{ steps.notes.outputs.bodyPath }}
           files: |
             dist/*.zip
             dist/*.tar.gz
             dist/*.msi
-            dist/*.exe
-            dist/*sha256sum.txt
+            dist/SHA256SUMS-*.txt
+            dist/*-sha256sum.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-docker:
     name: Build Docker image
     runs-on: ubuntu-latest
+    # 推送 ghcr.io organization package 需要 packages:write；
+    # job 级 permissions 会覆盖 workflow 级，故此处显式声明所需权限
+    permissions:
+      contents: read
+      packages: write
     needs: build
     steps:
       - name: Checkout
@@ -185,4 +309,4 @@ jobs:
           fallback_sha: ${{ github.sha }}
       - name: Build and push Docker image
         run: |
-          docker buildx build --platform linux/amd64 --platform linux/arm64 --platform linux/arm/v7 --build-arg VERSION=${{ inputs.version }} -t ghcr.io/mokeyish/smartdns-rs:${{ steps.release_label.outputs.value }} --push -f ./docker/Dockerfile .
+          docker buildx build --platform linux/amd64 --platform linux/arm64 --platform linux/arm/v7 --build-arg VERSION=${{ inputs.version }} -t ghcr.io/${{ github.repository_owner }}/smartdns-rs:${{ steps.release_label.outputs.value }} --push -f ./docker/Dockerfile .

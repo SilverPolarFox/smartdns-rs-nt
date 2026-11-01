@@ -12,6 +12,11 @@ pub struct CacheConfig {
     /// ```
     pub size: Option<usize>,
 
+    /// maximum memory used by the cache in bytes, 0 means unlimited
+    ///
+    /// cache-mem-size [bytes]
+    pub mem_size: Option<usize>,
+
     /// enable persist cache when restart
     pub persist: Option<bool>,
 
@@ -54,6 +59,20 @@ pub struct CacheConfig {
     ///   serve-expired-reply-ttl 30
     /// ```
     pub serve_expired_reply_ttl: Option<u64>,
+
+    /// how long before expiry an entry is refreshed in the background
+    ///
+    /// serve-expired-prefetch-time [num]
+    pub serve_expired_prefetch_time: Option<u64>,
+
+    /// cache negative responses (NXDOMAIN / NODATA)
+    ///
+    /// cache-negative [yes|no]
+    /// ```
+    /// example:
+    ///   cache-negative yes
+    /// ```
+    pub cache_negative: Option<bool>,
 
     /// cache save interval
     pub checkpoint_time: Option<u64>,

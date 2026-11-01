@@ -17,7 +17,7 @@ use crate::{
     dns_rule::{DomainRuleMap, DomainRuleTreeNode},
     infra::ipset::IpSet,
     libdns::proto::rr::{Name, RecordType},
-    log::{debug, info, warn},
+    log::{debug, error, info, warn},
     proxy::ProxyConfig,
 };
 
@@ -118,6 +118,17 @@ impl RuntimeConfig {
             };
             Cow::Owned(path.to_path_buf())
         };
+
+        if !path.is_file() {
+            warn!(
+                "Configuration file '{}' not found. \
+                 Starting with built-in default settings. \
+                 Place your smartdns.conf at '{}' \
+                 or specify a custom configuration path using '-c <path>'.",
+                path.display(),
+                path.display()
+            );
+        }
 
         match builder.with_conf_file(&path).build() {
             Ok(cfg) => cfg.into(),
@@ -271,6 +282,36 @@ impl RuntimeConfig {
         self.expand_ptr_from_address.unwrap_or_default()
     }
 
+    /// whether to answer PTR for local addresses from the hosts file
+    #[inline]
+    pub fn local_ptr_enable(&self) -> bool {
+        self.local_ptr_enable.unwrap_or(true)
+    }
+
+    /// maximum number of concurrent queries, 0 means unlimited
+    #[inline]
+    pub fn max_query_limit(&self) -> usize {
+        self.max_query_limit.unwrap_or(65535)
+    }
+
+    /// whether nftset elements get a timeout of ttl * 3
+    #[inline]
+    pub fn nftset_timeout_enable(&self) -> bool {
+        self.nftset_timeout_enable.unwrap_or_default()
+    }
+
+    /// whether nftset operations log verbosely
+    #[inline]
+    pub fn nftset_debug(&self) -> bool {
+        self.nftset_debug.unwrap_or_default()
+    }
+
+    /// listener socket send/recv buffer size in bytes
+    #[inline]
+    pub fn socket_buff_size(&self) -> Option<usize> {
+        self.socket_buff_size
+    }
+
     /// whether resolv mdns
     #[inline]
     pub fn mdns_lookup(&self) -> bool {
@@ -305,6 +346,12 @@ impl RuntimeConfig {
         self.cache.size.unwrap_or(512)
     }
 
+    /// maximum cache memory in bytes, 0 means unlimited
+    #[inline]
+    pub fn cache_mem_size(&self) -> usize {
+        self.cache.mem_size.unwrap_or(0)
+    }
+
     /// enable persist cache when restart
     #[inline]
     pub fn cache_persist(&self) -> bool {
@@ -320,10 +367,37 @@ impl RuntimeConfig {
     /// cache persist file
     #[inline]
     pub fn cache_file(&self) -> PathBuf {
-        self.cache
-            .file
-            .to_owned()
-            .unwrap_or_else(|| std::env::temp_dir().join("smartdns.cache"))
+        if let Some(file) = self.cache.file.as_ref() {
+            if file.is_absolute() {
+                return file.to_owned();
+            }
+            if let Some(dir) = self.data_dir() {
+                return dir.join(file);
+            }
+        }
+
+        #[cfg(windows)]
+        let default_dir = if std::env::args().next_back().as_deref()
+            == Some("--ws7642ea814a90496daaa54f2820254f12")
+        {
+            PathBuf::from(DEFAULT_CONF_DIR)
+        } else {
+            std::env::current_exe()
+                .expect("failed to get current exe path")
+                .parent()
+                .expect("failed to get current exe directory")
+                .to_path_buf()
+        };
+
+        #[cfg(not(windows))]
+        let default_dir = std::env::temp_dir();
+
+        default_dir.join(
+            self.cache
+                .file
+                .as_deref()
+                .unwrap_or_else(|| Path::new("smartdns.cache")),
+        )
     }
 
     /// prefetch domain
@@ -353,6 +427,18 @@ impl RuntimeConfig {
     #[inline]
     pub fn serve_expired_reply_ttl(&self) -> u64 {
         self.cache.serve_expired_reply_ttl.unwrap_or(5)
+    }
+
+    /// how long before expiry an entry is refreshed in the background; 0 means derive from TTL
+    #[inline]
+    pub fn serve_expired_prefetch_time(&self) -> u64 {
+        self.cache.serve_expired_prefetch_time.unwrap_or(0)
+    }
+
+    /// cache negative responses (NXDOMAIN / NODATA)
+    #[inline]
+    pub fn cache_negative(&self) -> bool {
+        self.cache.cache_negative.unwrap_or(true)
     }
 
     /// List of hosts that supply bogus NX domain results
@@ -390,6 +476,12 @@ impl RuntimeConfig {
     #[inline]
     pub fn force_aaaa_soa(&self) -> bool {
         self.force_aaaa_soa.unwrap_or_default()
+    }
+
+    /// whether to strip CNAME records from answers
+    #[inline]
+    pub fn force_no_cname(&self) -> bool {
+        self.force_no_cname.unwrap_or_default()
     }
 
     /// force HTTPS query return SOA
@@ -532,6 +624,166 @@ impl RuntimeConfig {
     #[inline]
     pub fn audit_file(&self) -> Option<&Path> {
         self.audit.file.as_deref()
+    }
+
+    /// whether SOA-only responses are written to the audit log
+    #[inline]
+    pub fn audit_soa(&self) -> bool {
+        self.audit.soa.unwrap_or_default()
+    }
+
+    /// whether audit records are sent to syslog
+    #[inline]
+    pub fn audit_syslog(&self) -> bool {
+        self.audit.syslog.unwrap_or_default()
+    }
+
+    /// whether audit records are also printed to the console
+    #[inline]
+    pub fn audit_console(&self) -> bool {
+        self.audit.console.unwrap_or_default()
+    }
+
+    /// base directory for runtime data files
+    #[inline]
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    /// local domain suffix, resolved through the mDNS server group
+    #[inline]
+    pub fn local_domain(&self) -> Option<&Name> {
+        self.local_domain.as_ref()
+    }
+
+    /// odhcpd DHCPv6 lease file
+    #[inline]
+    pub fn odhcpd_lease_file(&self) -> Option<&Path> {
+        self.odhcpd_lease_file.as_deref()
+    }
+
+    /// per-client-CIDR filtering rules
+    #[inline]
+    pub fn ip_rules(&self) -> &[IpRule] {
+        &self.ip_rules
+    }
+
+    /// 合并匹配该客户端 IP 的 ip-rules 到全局过滤集合。
+    ///
+    /// 返回 `(ignore, blacklist, whitelist)`；没有匹配规则时直接复用全局 `Arc`，零拷贝。
+    pub fn ip_rule_sets_for(&self, client_ip: IpAddr) -> (Arc<IpSet>, Arc<IpSet>, Arc<IpSet>) {
+        if self.ip_rules.is_empty() {
+            return (
+                self.ignore_ip().clone(),
+                self.blacklist_ip().clone(),
+                self.whitelist_ip().clone(),
+            );
+        }
+
+        let (mut ignore, mut blacklist, mut whitelist) = (Vec::new(), Vec::new(), Vec::new());
+        for rule in &self.ip_rules {
+            if !rule.net.contains(&client_ip) {
+                continue;
+            }
+            if rule.ignore {
+                ignore.push(rule.net);
+            }
+            if rule.blacklist {
+                blacklist.push(rule.net);
+            }
+            if rule.whitelist {
+                whitelist.push(rule.net);
+            }
+        }
+
+        let merge = |global: &Arc<IpSet>, extra: Vec<IpNet>| -> Arc<IpSet> {
+            if extra.is_empty() {
+                return global.clone();
+            }
+            let mut merged = (**global).clone();
+            for net in extra {
+                merged.insert(net, ());
+            }
+            Arc::new(merged)
+        };
+
+        (
+            merge(self.ignore_ip(), ignore),
+            merge(self.blacklist_ip(), blacklist),
+            merge(self.whitelist_ip(), whitelist),
+        )
+    }
+
+    /// 匹配该客户端 IP 的 `-bogus-nxdomain` 规则集合。
+    pub fn ip_rule_bogus_set_for(&self, client_ip: IpAddr) -> IpSet {
+        IpSet::new(
+            self.ip_rules
+                .iter()
+                .filter(|rule| rule.bogus_nxdomain && rule.net.contains(&client_ip))
+                .map(|rule| rule.net),
+        )
+    }
+
+    /// whether ipset entries get a timeout of ttl * 3
+    #[inline]
+    pub fn ipset_timeout_enable(&self) -> bool {
+        self.ipset_timeout_enable.unwrap_or_default()
+    }
+
+    /// refuse clients that do not match any client-rules entry
+    #[inline]
+    pub fn acl_enable(&self) -> bool {
+        self.acl_enable.unwrap_or_default()
+    }
+
+    /// ipset receiving addresses that fail the speed check
+    #[inline]
+    pub fn ipset_no_speed(&self) -> Option<&str> {
+        self.ipset_no_speed.as_deref()
+    }
+
+    /// nft set for addresses that fail the speed check
+    #[inline]
+    pub fn nftset_no_speed(&self) -> Option<&[ConfigForIP<NFTsetConfig>]> {
+        self.nftset_no_speed.as_deref()
+    }
+
+    /// whether a self-signed certificate is generated when none is configured
+    #[inline]
+    pub fn bind_cert_generate(&self) -> bool {
+        self.bind_cert_generate.unwrap_or_default()
+    }
+
+    /// root CA key used to sign the generated certificate
+    #[inline]
+    pub fn bind_cert_root_key_file(&self) -> Option<&Path> {
+        self.bind_cert_root_key_file.as_deref()
+    }
+
+    /// extra SANs for the generated certificate
+    #[inline]
+    pub fn bind_cert_san(&self) -> &[String] {
+        self.bind_cert_san.as_deref().unwrap_or_default()
+    }
+
+    /// validity of the generated certificate in days
+    #[inline]
+    pub fn bind_cert_validity_days(&self) -> Option<u64> {
+        self.bind_cert_validity_days
+    }
+
+    /// whether failed query packets are dumped to disk
+    #[inline]
+    pub fn debug_save_fail_packet(&self) -> bool {
+        self.debug_save_fail_packet.unwrap_or_default()
+    }
+
+    /// directory for dumped failed packets
+    #[inline]
+    pub fn debug_save_fail_packet_dir(&self) -> PathBuf {
+        self.debug_save_fail_packet_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/smartdns"))
     }
 
     #[inline]
@@ -680,6 +932,18 @@ impl RuntimeConfigBuilder {
             }
         }
 
+        let managed_dir = self.conf_dir.as_deref().map(|dir| {
+            let dir = dir.join("managed");
+            if !dir.exists() {
+                let _ = std::fs::create_dir_all(&dir);
+            }
+            dir
+        });
+
+        if let Some(ref managed_dir) = managed_dir {
+            let _ = Self::load_managed_dir(&mut self, managed_dir);
+        }
+
         let conf_file = self.conf_file;
         let conf_dir = self.conf_dir;
         let mut cfg = self.config;
@@ -723,7 +987,7 @@ impl RuntimeConfigBuilder {
         });
         let ip_alias = Arc::new(IpMap::from_iter(ip_alias));
 
-        for (_, rule) in self.rule_groups.iter_mut() {
+        for rule in self.rule_groups.values_mut() {
             if !rule.cnames.is_empty() {
                 rule.cnames.dedup_by(|a, b| a.domain == b.domain);
             }
@@ -760,6 +1024,8 @@ impl RuntimeConfigBuilder {
                 &rule_group.cnames,
                 &rule_group.srv_records,
                 &rule_group.https_records,
+                &rule_group.txt_records,
+                &rule_group.ipsets,
                 &cfg.nftsets,
             );
             domain_rule_group_map.insert(group_name.to_string(), domain_rule_map);
@@ -857,14 +1123,6 @@ impl RuntimeConfigBuilder {
 
         std::mem::swap(&mut proxy_servers, &mut cfg.proxy_servers);
 
-        let managed_dir = conf_dir.as_deref().map(|dir| {
-            let dir = dir.join("managed");
-            if !dir.exists() {
-                let _ = std::fs::create_dir_all(&dir);
-            }
-            dir
-        });
-
         Ok(RuntimeConfig {
             conf_dir,
             conf_file,
@@ -936,6 +1194,23 @@ impl RuntimeConfigBuilder {
         Ok(())
     }
 
+    fn load_managed_dir(&mut self, managed_dir: &Path) -> anyhow::Result<()> {
+        if !managed_dir.exists() {
+            return Ok(());
+        }
+        let entries = match std::fs::read_dir(managed_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "conf") {
+                let _ = self.load_file(&path);
+            }
+        }
+        Ok(())
+    }
+
     pub fn config(&mut self, line: &str) {
         use crate::config::parser::ConfigItem::*;
         let rule_group = match self.rule_group_stack.last_mut() {
@@ -980,7 +1255,53 @@ impl RuntimeConfigBuilder {
                 SpeedMode(v) => self.speed_check_mode = v,
                 ServeExpiredTtl(v) => self.cache.serve_expired_ttl = Some(v),
                 ServeExpiredReplyTtl(v) => self.cache.serve_expired_reply_ttl = Some(v),
+                ServeExpiredPrefetchTime(v) => self.cache.serve_expired_prefetch_time = Some(v),
+                ForceNoCNAME(v) => self.force_no_cname = Some(v),
+                LocalPtrEnable(v) => self.local_ptr_enable = Some(v),
+                MaxQueryLimit(v) => self.max_query_limit = Some(v),
+                NftsetTimeoutEnable(v) => self.nftset_timeout_enable = Some(v),
+                NftsetDebug(v) => self.nftset_debug = Some(v),
+                SocketBuffSize(v) => self.socket_buff_size = Some(v),
+                DataDir(v) => self.data_dir = Some(self.resolve_filepath(v)),
+                LocalDomain(v) => self.local_domain = v.0,
+                OdhcpdLeaseFile(v) => self.odhcpd_lease_file = Some(self.resolve_filepath(v)),
+                IpRule(v) => self.ip_rules.push(v),
+                IpSet(v) => rule_group.ipsets.push(v),
+                IpSetTimeoutEnable(v) => self.ipset_timeout_enable = Some(v),
+                IpSetNoSpeed(v) => self.ipset_no_speed = Some(v),
+                AclEnable(v) => self.acl_enable = Some(v),
+                GroupMatch(v) => {
+                    for domain in v.domains {
+                        rule_group.forward_rules.push(crate::config::ForwardRule {
+                            domain,
+                            nameserver: v.group.clone(),
+                        });
+                    }
+                    for client in v.clients {
+                        self.client_rules.push(crate::config::ClientRule {
+                            client,
+                            group: v.group.clone(),
+                        });
+                    }
+                }
+                DebugSaveFailPacket(v) => self.debug_save_fail_packet = Some(v),
+                BindCertGenerate(v) => self.bind_cert_generate = Some(v),
+                BindCertRootKeyFile(v) => {
+                    self.bind_cert_root_key_file = Some(self.resolve_filepath(v))
+                }
+                BindCertSan(v) => self.bind_cert_san = Some(v.0),
+                BindCertValidityDays(v) => self.bind_cert_validity_days = Some(v),
+                LogSyslog(v) => self.log.syslog = Some(v),
+                AuditSyslog(v) => self.audit.syslog = Some(v),
+                NftsetNoSpeed(v) => self.nftset_no_speed = Some(v.0),
+                DebugSaveFailPacketDir(v) => {
+                    self.debug_save_fail_packet_dir = Some(self.resolve_filepath(v))
+                }
+                LogColor(v) => self.log.color = Some(v),
+                AuditSoa(v) => self.audit.soa = Some(v),
+                AuditConsole(v) => self.audit.console = Some(v),
                 CacheSize(v) => self.cache.size = Some(v),
+                CacheMemSize(v) => self.cache.mem_size = Some(v),
                 ForceQtypeSoa(v) => {
                     self.force_qtype_soa.insert(v);
                 }
@@ -1007,7 +1328,9 @@ impl RuntimeConfigBuilder {
                 CaPath(v) => self.ca_path = Some(v),
                 ConfFile(v) => {
                     if !self.loaded_files.contains(&v) {
-                        self.load_file(v.clone()).expect("load_file failed");
+                        if let Err(e) = self.load_file(v.clone()) {
+                            error!("failed to load config file {:?}: {}", v, e);
+                        }
                         if let Some(dir) = v.parent() {
                             self.dirs.insert(dir.to_path_buf());
                         }
@@ -1018,6 +1341,7 @@ impl RuntimeConfigBuilder {
                 DnsmasqLeaseFile(v) => self.dnsmasq_lease_file = Some(v),
                 ResolvFile(v) => self.resolv_file = Some(v),
                 SrvRecord(v) => rule_group.srv_records.push(v),
+                TxtRecord(v) => rule_group.txt_records.push(v),
                 DomainRule(v) => rule_group.domain_rules.push(v),
                 ForwardRule(v) => rule_group.forward_rules.push(v),
                 User(v) => self.user = Some(v),
@@ -1077,7 +1401,7 @@ impl RuntimeConfigBuilder {
             },
             Ok((_, None)) => (),
             Err(err) => {
-                warn!("unknown conf: {}, {:?}", line, err);
+                error!("unknown conf: {}, {:?}", line, err);
             }
         }
     }
@@ -1992,5 +2316,228 @@ mod tests {
 
         assert_eq!(cfg.client_rules().len(), 1);
         assert_eq!(cfg.client_rules()[0].group, "office");
+    }
+
+    /// 发行包内附带、且由 `service install` 写入系统的默认配置必须逐条可解析：
+    /// 指令名写错只会在装完服务后表现为"解析不了域名"，是最难排查的故障。
+    #[test]
+    fn test_shipped_confs_parse_and_default_conf_is_usable() {
+        for (file, content) in [
+            ("etc/smartdns/smartdns.conf", crate::DEFAULT_CONF),
+            (
+                "etc/smartdns/example.conf",
+                include_str!("../etc/smartdns/example.conf"),
+            ),
+        ] {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let (rest, item) = parser::parse_config(line)
+                    .map_err(|err| format!("{file} 该行无法解析: {line} -> {err:?}"))
+                    .unwrap();
+
+                assert!(rest.trim().is_empty(), "{file} 该行含未识别参数: {line}");
+                assert!(item.is_some(), "{file} 该行未产生任何配置项: {line}");
+            }
+        }
+
+        let mut builder = RuntimeConfig::builder();
+        for line in crate::DEFAULT_CONF.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            builder = builder.with(line);
+        }
+        let cfg = builder.build().unwrap();
+
+        assert!(!cfg.binds().is_empty(), "默认配置必须包含 DNS 监听");
+        assert!(
+            !cfg.servers().is_empty(),
+            "默认配置必须包含上游 DNS 服务器，否则开箱不可用"
+        );
+        assert!(
+            matches!(cfg.response_mode(), ResponseMode::FastestResponse),
+            "默认配置应使用 fastest-response 以发挥多上游竞速"
+        );
+    }
+
+    /// 同一域名的多条 txt-record 必须累积成同一个 TXT RRset（对齐 C 版行为）。
+    #[test]
+    fn test_txt_record_accumulates_per_domain() {
+        let cfg = RuntimeConfig::builder()
+            .with("txt-record /example.com/v=spf1 -all")
+            .with("txt-record /example.com/second value")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            cfg.domain_rule_group("default")
+                .find(&"example.com".parse().unwrap())
+                .cloned()
+                .get(|rule| rule.txt.clone()),
+            Some(vec!["v=spf1 -all".to_string(), "second value".to_string()])
+        );
+    }
+
+    /// 补齐的四个 C 版指令必须能解析并落到正确的配置字段，默认值与 C 版一致。
+    #[test]
+    fn test_parity_directives() {
+        let cfg = RuntimeConfig::builder()
+            .with("max-query-limit 1234")
+            .with("force-no-CNAME yes")
+            .with("local-ptr-enable no")
+            .with("serve-expired-prefetch-time 90")
+            .with("nftset-timeout yes")
+            .with("nftset-debug yes")
+            .with("socket-buff-size 262144")
+            .with("data-dir /tmp/smartdns-data")
+            .with("log-color no")
+            .with("audit-SOA yes")
+            .with("audit-console yes")
+            .with("local-domain lan")
+            .with("odhcpd-lease-file /tmp/odhcpd.leases")
+            .with("cache-mem-size 1048576")
+            .with("debug-save-fail-packet yes")
+            .with("debug-save-fail-packet-dir /tmp/smartdns-debug")
+            .with("nftset-no-speed #4:inet#tab#nospeed")
+            .with("bind-cert-generate yes")
+            .with("bind-cert-san dns.example.com,1.2.3.4")
+            .with("bind-cert-validity-days 30")
+            .with("log-syslog yes")
+            .with("audit-syslog yes")
+            .with("ipset /example.com/smartdns_v4")
+            .with("ipset-timeout yes")
+            .with("ipset-no-speed smartdns_nospeed")
+            .with("acl-enable yes")
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.max_query_limit(), 1234);
+        assert!(cfg.force_no_cname());
+        assert!(!cfg.local_ptr_enable());
+        assert_eq!(cfg.serve_expired_prefetch_time(), 90);
+        assert!(cfg.nftset_timeout_enable());
+        assert!(cfg.nftset_debug());
+        assert_eq!(cfg.socket_buff_size(), Some(262144));
+        assert_eq!(cfg.data_dir(), Some(Path::new("/tmp/smartdns-data")));
+        assert!(!cfg.log_config().color());
+        assert!(cfg.audit_soa());
+        assert!(cfg.audit_console());
+        assert_eq!(cfg.local_domain(), Some(&"lan".parse().unwrap()));
+        assert_eq!(
+            cfg.odhcpd_lease_file(),
+            Some(Path::new("/tmp/odhcpd.leases"))
+        );
+        assert_eq!(cfg.cache_mem_size(), 1_048_576);
+        assert!(cfg.debug_save_fail_packet());
+        assert_eq!(
+            cfg.debug_save_fail_packet_dir(),
+            PathBuf::from("/tmp/smartdns-debug")
+        );
+
+        let default = RuntimeConfig::default();
+        assert_eq!(default.max_query_limit(), 65535, "C 版默认上限");
+        assert!(!default.force_no_cname());
+        assert!(default.local_ptr_enable(), "C 版默认开启本地 PTR");
+        assert_eq!(default.serve_expired_prefetch_time(), 0);
+        assert!(default.log_config().color(), "C 版 log-color 默认开启");
+        assert!(!default.audit_soa());
+        assert!(!default.audit_console());
+        assert_eq!(default.local_domain(), None);
+        assert_eq!(default.cache_mem_size(), 0, "C 版默认不限制");
+        assert_eq!(cfg.nftset_no_speed().map(|s| s.len()), Some(1));
+        assert!(cfg.bind_cert_generate());
+        assert_eq!(
+            cfg.bind_cert_san(),
+            &["dns.example.com".to_string(), "1.2.3.4".to_string()]
+        );
+        assert_eq!(cfg.bind_cert_validity_days(), Some(30));
+        assert!(cfg.log_config().syslog());
+        assert!(cfg.audit_syslog());
+        assert!(cfg.ipset_timeout_enable());
+        assert!(cfg.acl_enable());
+        assert_eq!(cfg.ipset_no_speed(), Some("smartdns_nospeed"));
+        assert_eq!(
+            cfg.rule_groups().get("default").map(|g| g.ipsets.len()),
+            Some(1)
+        );
+        assert!(!default.debug_save_fail_packet());
+        assert_eq!(default.nftset_no_speed(), None);
+        assert!(!default.bind_cert_generate());
+        assert!(default.bind_cert_san().is_empty());
+        assert_eq!(default.bind_cert_validity_days(), None);
+        assert!(!default.log_config().syslog());
+        assert!(!default.audit_syslog());
+        assert!(!default.ipset_timeout_enable());
+        assert!(!default.acl_enable());
+        assert_eq!(default.ipset_no_speed(), None);
+        assert_eq!(
+            default.debug_save_fail_packet_dir(),
+            PathBuf::from("/tmp/smartdns")
+        );
+    }
+
+    /// ip-rules 只对匹配的客户端 CIDR 生效。
+    #[test]
+    fn test_ip_rules_per_client() {
+        let cfg = RuntimeConfig::builder()
+            .with("ip-rules 192.168.1.0/24 -blacklist-ip")
+            .with("ip-rules 10.0.0.0/8 -bogus-nxdomain")
+            .build()
+            .unwrap();
+
+        let (_, blacklist, _) = cfg.ip_rule_sets_for("192.168.1.5".parse().unwrap());
+        assert!(blacklist.contains(&"192.168.1.5".parse::<IpAddr>().unwrap()));
+        assert!(!blacklist.contains(&"10.1.2.3".parse::<IpAddr>().unwrap()));
+
+        let bogus = cfg.ip_rule_bogus_set_for("10.1.2.3".parse().unwrap());
+        assert!(bogus.contains(&"10.9.9.9".parse::<IpAddr>().unwrap()));
+        assert!(
+            cfg.ip_rule_bogus_set_for("192.168.1.5".parse().unwrap())
+                .is_empty()
+        );
+    }
+
+    /// group-match 应翻译成 forward rule（域名→组）与 client rule（客户端→组）。
+    #[test]
+    fn test_group_match_sugar() {
+        let cfg = RuntimeConfig::builder()
+            .with("group-match -g office -d example.com -c 192.168.1.0/24")
+            .build()
+            .unwrap();
+
+        assert_eq!(cfg.client_rules().len(), 1);
+        assert_eq!(cfg.client_rules()[0].group, "office");
+
+        let groups = cfg.rule_groups();
+        let default_group = groups.get("default").expect("default group");
+        assert_eq!(default_group.forward_rules.len(), 1);
+        assert_eq!(default_group.forward_rules[0].nameserver, "office");
+    }
+
+    /// data-dir 应改变相对 cache-file 的落点，绝对路径保持不变。
+    #[test]
+    fn test_data_dir_resolves_relative_cache_file() {
+        let cfg = RuntimeConfig::builder()
+            .with("data-dir /tmp/smartdns-data")
+            .with("cache-file smartdns.cache")
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            cfg.cache_file(),
+            Path::new("/tmp/smartdns-data").join("smartdns.cache")
+        );
+
+        let cfg = RuntimeConfig::builder()
+            .with("data-dir /tmp/smartdns-data")
+            .with("cache-file /var/cache/smartdns.cache")
+            .build()
+            .unwrap();
+        assert_eq!(cfg.cache_file(), PathBuf::from("/var/cache/smartdns.cache"));
     }
 }
